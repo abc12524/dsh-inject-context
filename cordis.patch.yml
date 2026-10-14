@@ -1,13 +1,15 @@
 # Bundle patch layer for dsh-inject-context.
 #
-# A single `insert` row loads this package's main entry as the host half
-# (a plain Cordis plugin). This package ships no Config schema, so the `config:`
-# block below is passed verbatim to `apply(ctx, config)`; omitted keys fall back
-# to the defaults in lib/index.js.
+# A single `insert` row loads this package's main entry as the host half (a
+# plain Cordis plugin); the `dsh.client` declaration in package.json is what
+# makes the web app load ./client as the browser half.
+#
+# No `config:` block here on purpose. Every user-facing field is `.volatile()`,
+# so the settings card on the Plugins page owns it and its value belongs in the
+# profile's own patch layer — restating a value here would shadow the form and
+# turn "reset to default" into a no-op. The ordinary fields (maxChars,
+# timeoutMs, dedupeUnchanged) are edited by adding a `config:` block to this
+# entry in YOUR profile patch, never in this file.
 - insert:
     - id: dsh-inject-context
       name: dsh-inject-context
-      config:
-        # 检索阈值 0~1（越高要求越相关）与条数，随请求体发给 OpenViking find。
-        scoreThreshold: 0.4
-        limit: 3

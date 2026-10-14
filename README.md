@@ -1,8 +1,10 @@
 # dsh-inject-context
 
-一个**最小可用**的 DeepSeek Harness 上下文注入样本插件。
+一个 DeepSeek Harness 上下文注入插件，**带 Plugins 页面上的设置页**。
 
 它只做一件事：在每一步模型请求之前，拿**本轮用户输入**去检索 OpenViking 记忆（只用 `find` 接口），把检索结果包成 recall 块，作为**一条独立的 `user` 消息**追加到本步消息列表末尾。
+
+连接参数、相似度阈值、条数、每条字符上限都在设置页里改 —— **密钥走 harness 的凭据域，不写进配置文件**。
 
 ```
 用户: 我的主题偏好是什么
@@ -94,7 +96,19 @@ bundle 会让 harness 自动应用包内的 `cordis.patch.yml`，把插件条目
 
 （`name` 是 module specifier，从 profile 目录解析，所以仍需要 `pnpm add` 让包可解析。）
 
-无需构建步骤：`lib/index.js` 就是最终产物。
+无需构建步骤：`lib/index.js`（宿主半）和 `lib/client.js`（浏览器半）都是最终产物。浏览器半是手写的 `window.__ModuleLoader__.load({ id, factory })` 包装，`require` 由运行时 loader 注入 —— 不需要打包器。
+
+### 为什么插件能 `import '@deepseek-ai/schemastery'`
+
+`@deepseek-ai/*` 包**并不在 profile 的 `node_modules` 里**（profile 用 `nodeLinker: hoisted`，只会平铺 profile 自己声明的依赖）。所以本包把它声明成 `peerDependencies`：
+
+```json
+"peerDependencies": { "@deepseek-ai/schemastery": "^3.18.2" }
+```
+
+`dsh-app-boot` 会装一个 **profile 解析引导**（`lib/worker/profile-resolution-bootstrap.js`），劫持 Node 的 ESM 与 CJS 解析器：它沿插件文件向上找 `package.json`、读其中的 `peerDependencies`，命中就把这个 import **路由到 harness 自己的那份副本**。dsh-context 能用 `@deepseek-ai/schemastery` 正是同一机制 —— 这也是为什么 profile 的 `pnpm-workspace.yaml` 故意写着 `autoInstallPeers: false`。
+
+同一份声明也进了 `devDependencies`，只为了让 `node test/smoke.mjs` 在没有 harness 的环境里也能用真实 schemastery 跑起来；生产安装不会拉它（pnpm 不装被依赖包的 devDependencies）。
 
 ---
 
@@ -106,52 +120,99 @@ bundle 会让 harness 自动应用包内的 `cordis.patch.yml`，把插件条目
 node test/smoke.mjs
 ```
 
-它用一个 mock Cordis context 跑完全部用例，并把 `find` 请求替换成 stub，另外**把 harness 的持久化校验规则镜像了一份**（`assertMessageEventShape`）——注入出来的消息必须能通过这道校验，否则真实运行时会 `throw`。
+它用真实 `@deepseek-ai/schemastery` 校验 `Config`，用一个 mock Cordis context 跑宿主半、`find` 请求换成 stub，并用一个 Client module loader 的替身**把浏览器半真的加载起来**验证设置页接线 —— 否则那部分只能靠开网页手点。另外**把 harness 的持久化校验规则镜像了一份**（`assertMessageEventShape`）：注入出来的消息必须能通过这道校验，否则真实运行时会 `throw`。
 
 覆盖的用例：
 
 | 用例 | 断言 |
 |---|---|
-| 1 | 带真实用户输入的 step → 恰好追加 1 条，既有消息原样透传；`find` 的 query 就是用户问题 |
-| 2 | 工具续跑的 step（claim 为空）→ 不注入 |
-| 3 | 新 turn、输入与检索结果都没变、旧消息仍在 surface 上 → 去重不注入 |
-| 3b | 旧消息已被压缩掉 → **必须重新注入** |
-| 3c | session 形状读不出来 → **安全兜底：注入**（宁可多发几个 token，也不能把模型饿死） |
-| 3d | 检索结果变了 → 重新注入 |
-| 4 | 别的插件的注入（`source.kind !== 'user'`）不会被误当作用户输入 |
-| 5 | 检索请求失败（连接错误）→ 降级为不注入 + 记 warning |
-| 5b | 检索返回非 2xx（如 401）→ 降级为不注入 |
-| 6 | turn 已取消 → 不注入 |
-| 7 | `apply()` 返回的 disposer 能摘掉监听 |
+| 1 | `Config` 有 10 个 `.volatile()` 字段、`apiKeyEnv` 的 role 是 `credential-ref`、无 secret 字面量；volatile 字段是 `.get()` 引用、普通字段是普通值 |
+| 2 | 首个 step 恰好追加 1 条，既有消息原样透传；`find` 的 URL / 请求头 / `query` / `score_threshold` / `limit` 全部正确；重 uri 去重、按分数降序、超长 abstract 在 `abstractChars` 处截断并标记 |
+| 3 | 工具续跑的 step（claim 为空）→ 不检索也不注入 |
+| 4 | 结果未变且旧副本仍在 surface 上 → 跳过；已被压缩掉 → **必须补回**；session 形状读不出来 → **兜底注入** |
+| 5 | 别的插件的注入（`source.kind !== 'user'`）不会被误当作用户输入 |
+| 6 | `enabled: false` → 完全不碰网络 |
+| 7 | `host` 留空 → 不注入不请求 |
+| 8 | host 里自带 `https://` 和端口也能正确拼接 |
+| 8b | `abstractChars: 0` → 不截断 |
+| 9 | 401 / 500 / 非 JSON 响应 / 网络错误 / 超时 → 告警 + 降级不注入；**空结果是正常情况，静默** |
+| 10 | turn 已取消 → 不注入 |
+| 11 | 配置按轮读取（live ref），设置页改动下一轮生效 |
+| 12 | `apply()` 返回的 disposer 摘掉全部两个监听 |
+| 13 | 浏览器半注册 `plugins.bundle.config`，**key 等于包名**；语言包齐备；summary 视图可用 |
 
 ---
 
-## 配置
+## 配置与设置页
 
-本包**不带 Config schema**（保持零依赖）。`cordis.patch.yml` 里的 `config:` 会原样传给 `apply(ctx, config)`，未提供的走默认值：
+插件的配置分成两类，这个划分是整个设置体系的关键：
+
+| 类别 | 声明方式 | 在哪改 | 用途 |
+|---|---|---|---|
+| **设置页字段** | 加 `.volatile()` | Plugins 页面 → 本 bundle 的页面 → 配置区 | 用户面向的连接与检索调参 |
+| **普通配置** | 不加修饰 | profile 的 Cordis patch | 运维级旋钮，不需要表单 |
+
+`@deepseek-ai/dsh-settings` 说得很直接：**表单只暴露 `.volatile()` 字段**（"Forms expose only volatile fields from active, uniquely addressed profile entries"）。普通字段在设置页里根本不出现。
+
+还有一条容易踩的：**没有任何内置客户端会按 schema 自动建页**。同一份 README 写着 `autoGenerate` 是"for clients that build pages from the schema; **no shipped client does so yet**"，我在 asar 里核对过 —— `autoGenerate` 的消费者只有 `dsh-api-remotes` / `dsh-api-settings-controller` / `dsh-settings`，**零个 `dsh-client-ui-*`**。所以 `lib/client.js` 是必须写的，它把卡片注册进 `plugins.bundle.config` 槽（key = 包名）。
+
+### 设置页字段
+
+| 控件 | 默认 | 说明 |
+|---|---|---|
+| 启用注入（开关） | `on` | 关掉后不检索、不注入 |
+| OpenViking Host | （空） | 留空 = 不检索。可写 `host`、`host:port` 或 `https://host` |
+| 端口 | `1933` | host 里没写端口时用它 |
+| 用户 | （空） | `X-OpenViking-User` |
+| 账号 | `default` | `X-OpenViking-Account` |
+| 对端 | `default` | `X-OpenViking-Peer` |
+| **API Key** | （空） | **写进凭据域**，不落配置文件 |
+| 凭据引用名 | `OPENVIKING_API_KEY` | 密钥存在哪个名字下 |
+| 相似度阈值 | `0.4` | 见下方实测 |
+| 最多条数 | `3` | 每轮请求多少条 |
+| 每条字符上限 | `1200` | 0 = 不截断 |
+
+### 普通配置（profile patch）
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `scoreThreshold` | `0.4` | **检索阈值**（0~1，越高要求越相关），随请求体发给 `find` |
-| `limit` | `3` | **检索条数**，随请求体发给 `find` |
-| `maxChars` | `6000` | 注入文本的硬上限 |
-| `timeoutMs` | `3000` | 检索请求超时。**强制项**：pre-step 是被 await 的，卡住多少就加多少首字节延迟 |
+| `maxChars` | `6000` | 注入块整体的字符硬上限 |
+| `timeoutMs` | `3000` | 检索超时。**强制**：pre-step 被 await，卡住多少就加多少首字节延迟 |
 | `dedupeUnchanged` | `true` | 结果未变且旧副本仍在 surface 上时跳过 |
 
-### OpenViking 连接（当前硬编码）
+### 密钥为什么不进配置
 
-连接信息暂时写死在 `lib/index.js` 顶部，未走配置：
+`apiKeyEnv` 是一个**凭据引用名**（`role('credential-ref')`），真正的密文由 harness 的凭据域持有，落在 `~/.dsh/.credentials.yaml`。设置页只拿到 `{configured, writable}`，**永远读不到密文原文**；Host 半用 `ctx.credentials.resolve(ref)` 取用。
 
-| 常量 | 当前值 | 说明 |
-|---|---|---|
-| `OV_HOST` | `xxx.xxx.xxx.xxx` | 打码占位，待填真实 host |
-| `OV_PORT` | `1933` | 端口 |
-| `OV_KEY` | （空） | Bearer token。**留空会得到 401，按契约降级为不注入**，不会报错中断 |
-| `OV_USER` / `OV_PEER` | （空）/ `default` | 随 `X-OpenViking-User` / `X-OpenViking-Peer` 头发送 |
+这样配置文件里没有秘密，仓库里也没有 —— 对一个公开仓库是必需的。
 
-只使用 `POST /api/v1/search/find` 这一个接口。
+### 实测：OpenViking `find` 的真实返回
 
-想加 Config schema，用 `@deepseek-ai/schemastery` 或 profile 里可解析的 `zod`，然后 `export const Config = ...`。
+对本机部署实测 `POST /api/v1/search/find`，原始响应体是：
+
+```json
+{ "status": "ok",
+  "result": { "memories": [ { "context_type": "memory", "uri": "viking://…",
+                              "level": 2, "score": 0.4566, "abstract": "…", "tags": [] } ],
+              "resources": [], "skills": [], "total": 5 } }
+```
+
+对调参有用的几条结论：
+
+- **`score_threshold` 是服务端过滤的**，`limit` 也生效（实测阈值 0.8 / 0.95 都返回 0 条）。
+- **相似度分数被压缩在很窄的区间**：
+
+  | 查询 | top-5 分数 |
+  |---|---|
+  | `DeepSeek 上下文缓存优化`（强相关） | **0.683** 0.637 0.604 0.584 0.582 |
+  | `Flutter 文件工具接入`（相关） | **0.626** 0.573 0.542 0.505 0.491 |
+  | `上下文注入插件`（弱相关） | 0.457 0.424 0.395 0.393 0.391 |
+  | `zzzz qwertyuiop`（噪声） | 0.406 0.330 0.328 0.327 0.325 |
+  | `今天天气怎么样`（无关） | 0.278 0.273 0.263 0.258 0.253 |
+
+  强相关能到 0.6+，噪声上限约 0.41。**默认 0.4 是个合理的分界**：挡掉大多数噪声，又不至于把弱相关记忆一起丢掉。想更保守可以提到 0.45，代价是弱相关记忆也会被砍掉。
+- **`abstract` 可以长到约 1.6k 字符**，不是几百字。所以每条字符上限默认给到 `1200` —— 早期固定截 300 字符的写法会把最有价值的记忆砍掉八成。分数字段也因此打印三位小数，两位会把不同排名压成同一个数字。
+- **空 query 会得到 HTTP 400**，插件的 `query.length === 0` 守卫因此是有效的。
 
 ---
 
@@ -257,11 +318,12 @@ Gate 4 的第二个条件是必需的：内容没变不等于模型还看得到�
 
 ## 已知限制
 
-1. **连接信息硬编码**：`OV_HOST` / `OV_PORT` / `OV_KEY` / `OV_USER` / `OV_PEER` 目前写死在 `lib/index.js`，未走配置，也未走 harness 的 HTTP/凭据服务。定稿后应改为读配置。
-2. **直接用全局 `fetch`**：未经过 harness 的网络代理/沙箱策略；超时靠 `timeoutMs` 兜底。
+1. **直接用全局 `fetch`**：未经过 harness 的网络代理/沙箱策略；超时靠 `timeoutMs` 兜底。
+2. **只实现 `find`**：OpenViking 还有 `search`（带会话上下文）等接口，本插件只用了无上下文的向量 `find`。
 3. **`stillOnSurface()` 会调用 `session.snapshotEvents()` 扫日志**，长会话上是 O(n)。它只在「文本未变、需要判断是否跳过」时才跑，但生产版本应当换成 session projection，而不是扫全量日志。
 4. **单进程内存台账**：`ledger` 按 sessionId 存，`agent/disposed` 时清。跨进程/重启不保留（重启后第一次会重新注入，这是正确行为）。
 5. **`agent.session` 是内部形状**。`Agent` 的公开接口只保证 `id`；这里读的 `session.snapshotEvents()` / `session.surface.nodes` 都是 harness 内部约定，跨大版本可能需要适配。surface 判定失败时会安全降级为「照常注入」。
+6. **表单控件只能用 primitives 提供的那几种**。`@deepseek-ai/dsh-client-ui-primitives` 的 settings-form 只导出 `SettingsForm` / `SettingsFormModel` / `settingsTextField` / `settingsNumberField` / `SettingsValueField` / `SettingsSecretField` —— **没有布尔字段**。本插件的"启用"开关是靠自定义一个 `on`/`off` 的字段 spec 配 `Switch` primitive 实现的（见 `lib/client.js` 的 `settingsBooleanField`），因为 `SettingsFormModel` 的字段 spec 本质上只是 `format`/`parse` 一对函数，可以自己写。
 
 ---
 

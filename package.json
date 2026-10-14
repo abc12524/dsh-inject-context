@@ -1,7 +1,7 @@
 {
   "name": "dsh-inject-context",
   "version": "0.1.0",
-  "description": "Minimal DeepSeek Harness context-injection plugin: retrieves OpenViking memories for the user's input and appends them as one standalone user message at agent/pre-step.",
+  "description": "DeepSeek Harness context-injection plugin: retrieves OpenViking memories for the user's input and appends them as one standalone user message at agent/pre-step, with a settings page on the Plugins page.",
   "author": "abc12524",
   "repository": {
     "type": "git",
@@ -15,10 +15,12 @@
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
   "files": [
     "lib/index.js",
+    "lib/client.js",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -31,6 +33,15 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-api-remotes"
+      ],
+      "platform": "web"
     }
   },
   "keywords": [
@@ -38,7 +49,14 @@
     "dsh",
     "cordis",
     "plugin",
-    "context-injection"
+    "context-injection",
+    "openviking"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.2"
+  }
 }
