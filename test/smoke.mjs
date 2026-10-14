@@ -24,7 +24,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { Config, apply, inject, name } from '../lib/index.js'
+import { Config, SOURCES, apply, inject, name } from '../lib/index.js'
 
 // ---------------------------------------------------------------------------
 // Mock Cordis context
@@ -144,9 +144,9 @@ const credentials = {
 // ---------------------------------------------------------------------------
 
 const BASE_CONFIG = {
-  host: 'ov.test',
-  user: 'alice',
-  apiKeyEnv: 'TEST_KEY',
+  'ov.host': 'ov.test',
+  'ov.user': 'alice',
+  'ov.apiKeyEnv': 'TEST_KEY',
 }
 
 function mount(overrides = {}) {
@@ -175,15 +175,14 @@ assert.equal(Config.type, 'object')
 
 const VOLATILE_FIELDS = [
   'enabled',
-  'host',
-  'port',
-  'user',
-  'account',
-  'peer',
-  'apiKeyEnv',
-  'scoreThreshold',
-  'limit',
-  'abstractChars',
+  'ov.host',
+  'ov.user',
+  'ov.account',
+  'ov.peer',
+  'ov.apiKeyEnv',
+  'ov.scoreThreshold',
+  'ov.limit',
+  'ov.abstractChars',
 ]
 const ORDINARY_FIELDS = ['maxChars', 'timeoutMs', 'dedupeUnchanged']
 
@@ -194,7 +193,7 @@ for (const field of ORDINARY_FIELDS) {
   assert.notEqual(Config.dict[field]?.meta?.volatile, true, `${field} is ordinary configuration, not a form field`)
 }
 assert.equal(
-  Config.dict.apiKeyEnv?.meta?.role,
+  Config.dict['ov.apiKeyEnv']?.meta?.role,
   'credential-ref',
   'the key field names a credential; the literal must never live in configuration',
 )
@@ -207,8 +206,8 @@ assert.equal(
 // A volatile field arrives as a live reference, an ordinary one as a plain
 // value — the two shapes readConfig() has to cover.
 const liveConfig = Config({ ...BASE_CONFIG })
-assert.equal(typeof liveConfig.host?.get, 'function', 'volatile fields arrive as live references')
-assert.equal(liveConfig.host.get(), 'ov.test')
+assert.equal(typeof liveConfig['ov.host']?.get, 'function', 'volatile fields arrive as live references')
+assert.equal(liveConfig['ov.host'].get(), 'ov.test')
 assert.equal(typeof liveConfig.timeoutMs, 'number', 'ordinary fields arrive as plain values')
 assert.equal(liveConfig.timeoutMs, 3000)
 
@@ -388,7 +387,7 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
 
 {
   fetchCalls = []
-  const { hook } = mount({ host: '' })
+  const { hook } = mount({ 'ov.host': '' })
   const noHost = await runHook(hook, { agent, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   assert.equal(noHost.messages.length, 1)
   assert.equal(fetchCalls.length, 0)
@@ -402,7 +401,7 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
 {
   fetchCalls = []
   fetchImpl = async () => jsonResponse({ result: [] })
-  const { hook } = mount({ host: 'https://ov.example.com:8443/' })
+  const { hook } = mount({ 'ov.host': 'https://ov.example.com:8443/' })
   await runHook(hook, { agent: { id: 's2' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   assert.equal(fetchCalls[0]?.url, 'https://ov.example.com:8443/api/v1/search/find')
   console.log('case 8  ok  scheme and port are honoured when typed into the host field')
@@ -415,7 +414,7 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
 {
   fetchCalls = []
   fetchImpl = async () => jsonResponse(MEMORY_BODY)
-  const { hook } = mount({ abstractChars: 0 })
+  const { hook } = mount({ 'ov.abstractChars': 0 })
   const whole = await runHook(hook, { agent: { id: 's5' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   const text = whole.messages[1].content[0].text
   assert.ok(text.includes('结尾标记'), 'abstractChars=0 keeps the abstract whole')
@@ -507,8 +506,8 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   await runHook(hook, { agent: { id: 's3' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   assert.equal(JSON.parse(fetchCalls[0].init.body).limit, 3)
 
-  if (typeof config.limit?.set === 'function') {
-    config.limit.set(7)
+  if (typeof config['ov.limit']?.set === 'function') {
+    config['ov.limit'].set(7)
     await runHook(hook, { agent: { id: 's4' }, turn: 1, step: 1, signal }, [realUser('u2', 'hi again')])
     assert.equal(
       JSON.parse(fetchCalls[1].init.body).limit,
@@ -679,6 +678,39 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   assert.equal(typeof summary, 'string')
 
   console.log('case 13 ok  browser half registers plugins.bundle.config keyed by the package name')
+}
+
+// ---------------------------------------------------------------------------
+// Case 14 — a second source rides the same channel: one message each.
+// ---------------------------------------------------------------------------
+
+{
+  const NOTICE = '[fake source] a sibling injection source'
+  const fakeSource = {
+    id: 'fake',
+    provider: 'fake',
+    form: 'notice',
+    enabled: () => true,
+    collect: async () => NOTICE,
+  }
+  SOURCES.push(fakeSource)
+  try {
+    fetchCalls = []
+    fetchImpl = async () => jsonResponse(MEMORY_BODY)
+    const { hook } = mount()
+    const both = await runHook(hook, { agent: { id: 's6' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+    assert.equal(both.messages.length, 3, 'each enabled source appends exactly one message')
+    assert.equal(both.messages[0].source.kind, 'user', 'the real input passes through untouched')
+    // Sources run in registry order, each carrying its own provider/form.
+    assert.equal(both.messages[1].source.provider, 'openviking')
+    assert.equal(both.messages[1].source.form, 'recall')
+    assert.equal(both.messages[2].source.provider, 'fake')
+    assert.equal(both.messages[2].source.form, 'notice')
+    assert.equal(both.messages[2].content[0].text, NOTICE)
+    console.log('case 14 ok  a second source injects its own message through the shared channel')
+  } finally {
+    SOURCES.pop()
+  }
 }
 
 // ---------------------------------------------------------------------------
