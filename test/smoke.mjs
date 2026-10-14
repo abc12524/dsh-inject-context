@@ -173,18 +173,17 @@ assert.equal(name, 'dsh-inject-context')
 assert.deepEqual(inject, [], 'the plugin declares no hard service dependency')
 assert.equal(Config.type, 'object')
 
-const VOLATILE_FIELDS = [
-  'enabled',
-  'ov.host',
+const VOLATILE_FIELDS = ['enabled', 'ov.host', 'ov.scoreThreshold', 'ov.limit']
+const ORDINARY_FIELDS = [
+  'maxChars',
+  'timeoutMs',
+  'dedupeUnchanged',
   'ov.user',
   'ov.account',
   'ov.peer',
   'ov.apiKeyEnv',
-  'ov.scoreThreshold',
-  'ov.limit',
   'ov.abstractChars',
 ]
-const ORDINARY_FIELDS = ['maxChars', 'timeoutMs', 'dedupeUnchanged']
 
 for (const field of VOLATILE_FIELDS) {
   assert.equal(Config.dict[field]?.meta?.volatile, true, `${field} must be volatile to reach the settings form`)

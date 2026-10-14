@@ -6,7 +6,7 @@
 
 目前内置一个源 —— OpenViking（`ov`）：拿用户输入 `POST /api/v1/search/find`，把记忆包成 recall 块。**再加源只需往 `SOURCES` 注册一个适配器，并在 `Config` 里声明它的 `<id>.*` 配置项**，其余（触发闸门、去重、失败隔离、消息构造、设置页按前缀分组）全部共用。
 
-连接参数、相似度阈值、条数、每条字符上限都在设置页里改 —— **密钥走 harness 的凭据域，不写进配置文件**。
+连接参数（`host`）、相似度阈值、条数在设置页里改；`ov.user` / `ov.account` / `ov.peer` / `ov.abstractChars` 等高级项走普通配置（profile patch），**密钥走 harness 的凭据域，不写进配置文件**。
 
 配置按键分组：每个源一节，键名带源前缀（`ov.host`、`ov.scoreThreshold`…），第二个源就是与 `ov` 并列的兄弟键（`dir.root`…）。**用带点的平铺键而不是嵌套对象**是有意的 —— 设置页的 `SettingsFormModel` 只能寻址顶层字段，嵌套的 `sources.ov.host` 在卡片里读不到也写不进（详见「配置与设置页」）。
 
@@ -130,7 +130,7 @@ node test/smoke.mjs
 
 | 用例 | 断言 |
 |---|---|
-| 1 | `Config` 有 9 个 `.volatile()` 字段（`enabled` + `ov.*`）、`ov.apiKeyEnv` 的 role 是 `credential-ref`、无 secret 字面量；volatile 字段是 `.get()` 引用、普通字段是普通值 |
+| 1 | `Config` 有 4 个 `.volatile()` 字段（`enabled` + `ov.host` / `ov.scoreThreshold` / `ov.limit`）、`ov.apiKeyEnv` 的 role 是 `credential-ref`、无 secret 字面量；volatile 字段是 `.get()` 引用、普通字段是普通值 |
 | 2 | 首个 step 恰好追加 1 条，既有消息原样透传；`find` 的 URL / 请求头 / `query` / `score_threshold` / `limit` 全部正确；重 uri 去重、按分数降序、超长 abstract 在 `abstractChars` 处截断并标记 |
 | 3 | 工具续跑的 step（claim 为空）→ 不检索也不注入 |
 | 4 | 结果未变且旧副本仍在 surface 上 → 跳过；已被压缩掉 → **必须补回**；session 形状读不出来 → **兜底注入** |
@@ -168,20 +168,20 @@ node test/smoke.mjs
 | 配置键 | 控件 | 默认 | 说明 |
 |---|---|---|---|
 | `enabled` | 启用注入（开关） | `on` | 关掉后所有源都不跑 |
-| `ov.host` | OV · 主机 | （空） | 留空 = 停用该源。可写 `host`、`host:port` 或 `https://host:port`；端口并入 host（缺省 `1933`） |
-| `ov.user` | OV · 用户 | （空） | `X-OpenViking-User` |
-| `ov.account` | OV · 账号 | `default` | `X-OpenViking-Account` |
-| `ov.peer` | OV · 对端 | `default` | `X-OpenViking-Peer` |
+| `ov.host` | OV · 主机 | （空） | 格式 `ip:port`（如 `192.168.30.181:1933`），可带 `https://`；不写端口则用缺省 `1933`。留空 = 停用该源 |
 | 写only控件 | OV · **API Key** | （空） | **写进凭据域**，不落配置文件 |
-| `ov.apiKeyEnv` | OV · 凭据引用名 | `OPENVIKING_API_KEY` | 密钥存在哪个名字下 |
 | `ov.scoreThreshold` | OV · 相似度阈值 | `0.4` | 见下方实测 |
 | `ov.limit` | OV · 最多条数 | `3` | 每轮请求多少条 |
-| `ov.abstractChars` | OV · 每条字符上限 | `1200` | 0 = 不截断 |
 
 ### 普通配置（profile patch）
 
 | 键 | 默认 | 说明 |
 |---|---|---|
+| `ov.user` | （空） | `X-OpenViking-User` |
+| `ov.account` | `default` | `X-OpenViking-Account` |
+| `ov.peer` | `default` | `X-OpenViking-Peer` |
+| `ov.apiKeyEnv` | `OPENVIKING_API_KEY` | 密钥的凭据引用名 |
+| `ov.abstractChars` | `1200` | 每条记忆的字符上限；0 = 不截断 |
 | `maxChars` | `6000` | 注入块整体的字符硬上限 |
 | `timeoutMs` | `3000` | 检索超时。**强制**：pre-step 被 await，卡住多少就加多少首字节延迟 |
 | `dedupeUnchanged` | `true` | 结果未变且旧副本仍在 surface 上时跳过 |
