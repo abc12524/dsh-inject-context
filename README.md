@@ -139,15 +139,15 @@ node test/smoke.mjs
 
 ---
 
-## 副作用（重要）
+## 落盘与影响
 
-注入的消息是**durable** 的：`step()` 会把它 `session.append('user/message', …)` 写进会话日志。
+注入的消息**必然是 durable** 的 —— `step()` 会把它 `session.append('user/message', …)` 写进会话日志。这不是可以关掉的副作用，而是注入生效的唯一途径（原因见下一节）。
 
 | 影响 | 说明 |
 |---|---|
-| 进对话记录 | 会作为一条 user 消息出现在 Web UI 里 |
+| 进对话记录 | 在 Web UI 里渲染为一条带 `dsh-inject-context` 标签的**注入上下文行**，不是用户气泡 |
 | 占上下文 | 计入 token，参与压缩、上下文压力、会话导出 |
-| 可审计 | 带 `source.kind = 'dsh-inject-context'` 和 `provider` / `cwd`，能和真人输入区分 |
+| 可审计 | 带 `source.kind` / `provider` / `cwd`，能和真人输入区分 |
 | 不会重放 | 恢复会话时不会重新生成（消息已在历史里） |
 | 压缩后能自愈 | 旧副本被压缩掉后，下一次注入会自动补回 |
 | 不碰系统提示词 | 请求前缀逐字节不变，前缀缓存不受影响 |
@@ -159,15 +159,83 @@ node test/smoke.mjs
 {
   id: randomUUID(),                                  // ← 必填
   role: 'user',
-  source: { kind: 'dsh-inject-context', provider: 'dir', cwd },
+  source: { kind: 'dsh-inject-context', form: 'snapshot', provider: 'dir', cwd },
   content: [{ type: 'text', text }],
 }
 ```
 
 - **`id` 必填**：`@deepseek-ai/dsh-session` 的 `assertMessageEventShape` 会拒绝没有非空字符串 `id` 的消息 —— 少写就是运行时 `throw`。
 - **`source.kind` 可以用自定义值**：该校验只对 `system` / `assistant` / `tool` 的 kind 做枚举约束，`user/message` 的 kind 是开放的（harness 自己的动态上下文就用了 `'runtime-context'` 这个不在类型表里的值）。
+- **`source.kind` 决定 UI 怎么渲染**（见下节）。
 - **不要复用 `'runtime-context'`**：那个 kind 被 `RuntimeContextProjection` 用来做快照比对和替换链追踪，复用会被误清。
 - **content 只能是 text / image / file 块**：`tool-addition` / `tool-removal` 块在非 developer 角色上会被拒绝。
+
+---
+
+## 入库不是副作用，入库就是注入机制本身
+
+这是设计上最需要理解的一点：**没有任何办法把内容送进模型请求而不落盘**。
+
+链路是单向的：
+
+```
+pre-step 的 decision.messages
+   ↓  step() L1061
+session.append('user/message', message, { surfaceOp: 'append' })   ← 入库
+   ↓  成为 session surface 上的一个节点
+session.deriveMessages()  ←  L1554：遍历 surface.nodes，从日志派生消息
+   ↓  buildRequest() L1262
+request.messages                                                            ← 模型真正收到的
+```
+
+`buildRequest()` 里的 messages **完全来自 `session.deriveMessages()`**，不接收任何外部传入的消息表。而且这条捷径也被堵死了：
+
+- `request` 对象被 `Object.freeze()`，`messages` 数组也被冻结（`Object.freeze(boundaryMessages)`）；
+- `llm/stream` 的签名是 `(options, next: () => AsyncIterable<StreamChunk>)` —— `next` 不接受参数，无法替换 `options`。
+
+**所以："入库"和"让模型看到"是同一件事，不是两个可选动作。** 这也意味着 harness 自己的 `runtime-context` 快照同样是一条落盘的 `user/message` —— 本插件的行为和它完全一致。
+
+因为入库，注入内容自动获得：会话回放、参与压缩与裁剪、会话导出、`sessionQuery` 全文检索、`dsh-context` 的 Context Browser / Context Events 可见、进程重启后仍在。
+
+### UI 呈现
+
+`dsh-client-ui-chat` 对每一条落盘的 `user/message` 按 `source.kind` 分流：
+
+```js
+// client.js
+/** User, steering, and injected-context message classification Definition. */
+if (event.data.source.kind !== "user") {
+  return { ...contextMessage(event, event.data), waking: ... }   // → kind: 'context'
+}
+// source.kind === 'user' → kind: 'user' 或 'steering'
+```
+
+```js
+/** Context presentation shared by user-role injections and developer messages. */
+function contextMessage(event, message) {
+  return { kind: 'context', producer: contextProducer(message.source), form: contextForm(message.source), ... }
+}
+```
+
+- `contextProducer()` 对未知 kind 走 default 分支 → `{ role: 'inject', label: kind }`，所以这一行的标签就是 **`dsh-inject-context`**。
+- `contextForm()` 只认 `instructions` / `catalog` / `snapshot` / `notice` / `relay` / `recall`，其余（含缺省）留给不透明呈现。目录列表用 `'snapshot'`。
+
+结论：**注入消息在对话里渲染成一条带来源标签的"注入上下文"行，不是用户气泡。** 不需要额外写 client 半。
+
+---
+
+## 去重
+
+两层，都在插件内存里：
+
+| 闸门 | 键 | 挡住什么 |
+|---|---|---|
+| Gate 2 | `(sessionId, turn, queryHash)` | 同一个 turn 内多步（工具调用往复）重复注入 |
+| Gate 4 | `textHash` 未变 **且** 旧副本仍在 `session.surface.nodes` 上 | 跨 turn 的重复注入 |
+
+Gate 4 的第二个条件是必需的：内容没变不等于模型还看得到它 —— 压缩可能已经把它挤掉了。判不出来时**一律不跳过**（宁可多发几个 token，也不能让模型丢上下文）。
+
+局限：不跨进程/重启；不做内容级 chunk 去重（对目录列表没意义，换 RAG 才需要）；不跨 session。
 
 ---
 
@@ -175,9 +243,8 @@ node test/smoke.mjs
 
 1. **读目录走 `node:fs`，绕过了 harness 的 `fs` 服务**，因此不受文件沙箱策略约束。样本图的是短；生产版本应当改用 `ctx.fs.resolve()` + `ctx.fs.listDir()`。
 2. **`stillOnSurface()` 会调用 `session.snapshotEvents()` 扫日志**，长会话上是 O(n)。它只在「文本未变、需要判断是否跳过」时才跑，但生产版本应当换成 session projection，而不是扫全量日志。
-3. **客户端不认识 `source.kind = 'dsh-inject-context'`**，所以注入消息目前会显示成一条普通用户气泡。要折叠或加标记，需要另写 client 半（`dsh.client`）。
-4. **单进程内存台账**：`ledger` 按 sessionId 存，`agent/disposed` 时清。跨进程/重启不保留（重启后第一次会重新注入，这是正确行为）。
-5. **`agent.session` 是内部形状**。`Agent` 的公开接口只保证 `id`；这里读的 `session.header.cwd` / `session.snapshotEvents()` / `session.surface.nodes` 都是 harness 内部约定，跨大版本可能需要适配。
+3. **单进程内存台账**：`ledger` 按 sessionId 存，`agent/disposed` 时清。跨进程/重启不保留（重启后第一次会重新注入，这是正确行为）。
+4. **`agent.session` 是内部形状**。`Agent` 的公开接口只保证 `id`；这里读的 `session.header.cwd` / `session.snapshotEvents()` / `session.surface.nodes` 都是 harness 内部约定，跨大版本可能需要适配。surface 判定失败时会安全降级为「照常注入」。
 
 ---
 

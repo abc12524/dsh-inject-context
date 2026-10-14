@@ -129,7 +129,11 @@ assert.deepEqual(first.messages.slice(0, 2), [...claimed, harnessRuntimeContext]
 
 const injected = first.messages[2]
 assertPersistableUserMessage(injected, 'injected')
+// The client classifies every durable user message by source.kind: 'user'
+// renders as a user bubble, anything else as an injected-context row whose
+// producer label is the kind itself.
 assert.equal(injected.source.kind, 'dsh-inject-context')
+assert.equal(injected.source.form, 'snapshot', 'form selects the client context presentation')
 assert.equal(injected.source.cwd, root)
 assert.match(injected.content[0].text, /^<directory-listing cwd="/)
 assert.match(injected.content[0].text, /Directory of /)
