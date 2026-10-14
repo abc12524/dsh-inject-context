@@ -2,14 +2,14 @@
 
 一个**最小可用**的 DeepSeek Harness 上下文注入样本插件。
 
-它只做一件事：在每一步模型请求之前，把**会话当前目录的 `dir` 输出**作为**一条独立的 `user` 消息**追加到本步消息列表末尾。
+它只做一件事：在每一步模型请求之前，拿**本轮用户输入**去检索 OpenViking 记忆（只用 `find` 接口），把检索结果包成 recall 块，作为**一条独立的 `user` 消息**追加到本步消息列表末尾。
 
 ```
-用户: 帮我看看这个项目
+用户: 我的主题偏好是什么
        ↓
-[agent/pre-step]  dsh-inject-context 读 cwd → 渲染 dir 列表 → 追加一条 user 消息
+[agent/pre-step]  dsh-inject-context 取用户问题 → POST /api/v1/search/find → 包裹 recall 块 → 追加一条 user 消息
        ↓
-模型实际收到:  [用户消息] [runtime-context] [<directory-listing>…</directory-listing>]
+模型实际收到:  [用户消息] [runtime-context] [【自动检索的候选记忆…】…【检索结束…】]
                                               ↑ 本插件注入
 ```
 
@@ -25,7 +25,7 @@
 | 2 | **只追加一条 `role: 'user'` 消息** —— 不替换、不改写、不删除任何既有消息 |
 | 3 | **不注册任何 `systemPrompt` 贡献** —— 请求前缀（system prompt + 工具 schema）与不装本插件时**逐字节相同** |
 | 4 | **不声明任何服务依赖**（`inject = []`）—— 不用 `systemPrompt` / `tools` / `session` / `fs` 服务 |
-| 5 | **异常一律降级为"不注入"** —— 超时、`EACCES`、取消、畸形 payload 都不会打断这一轮对话 |
+| 5 | **异常一律降级为"不注入"** —— 超时、HTTP 非 2xx、取消、畸形响应都不会打断这一轮对话 |
 
 第 3 条是这个设计的最大好处：系统提示词注入会**每一步都在改请求前缀**，持续破坏提示词缓存；而消息尾部追加只影响请求末尾，前缀缓存完全不受影响。
 
@@ -87,6 +87,9 @@ bundle 会让 harness 自动应用包内的 `cordis.patch.yml`，把插件条目
 - insert:
     - id: dsh-inject-context
       name: dsh-inject-context
+      config:
+        scoreThreshold: 0.4
+        limit: 3
 ```
 
 （`name` 是 module specifier，从 profile 目录解析，所以仍需要 `pnpm add` 让包可解析。）
@@ -103,20 +106,21 @@ bundle 会让 harness 自动应用包内的 `cordis.patch.yml`，把插件条目
 node test/smoke.mjs
 ```
 
-它用一个 mock Cordis context 跑完 8 组用例，并且**把 harness 的持久化校验规则镜像了一份**（`assertMessageEventShape`）——注入出来的消息必须能通过这道校验，否则真实运行时会 `throw`。
+它用一个 mock Cordis context 跑完全部用例，并把 `find` 请求替换成 stub，另外**把 harness 的持久化校验规则镜像了一份**（`assertMessageEventShape`）——注入出来的消息必须能通过这道校验，否则真实运行时会 `throw`。
 
 覆盖的用例：
 
 | 用例 | 断言 |
 |---|---|
-| 1 | 带真实用户输入的 step → 恰好追加 1 条，既有消息原样透传 |
+| 1 | 带真实用户输入的 step → 恰好追加 1 条，既有消息原样透传；`find` 的 query 就是用户问题 |
 | 2 | 工具续跑的 step（claim 为空）→ 不注入 |
-| 3 | 新 turn、输入与列表都没变、旧消息仍在 surface 上 → 去重不注入 |
+| 3 | 新 turn、输入与检索结果都没变、旧消息仍在 surface 上 → 去重不注入 |
 | 3b | 旧消息已被压缩掉 → **必须重新注入** |
 | 3c | session 形状读不出来 → **安全兜底：注入**（宁可多发几个 token，也不能把模型饿死） |
-| 3d | 目录内容变了 → 重新注入 |
+| 3d | 检索结果变了 → 重新注入 |
 | 4 | 别的插件的注入（`source.kind !== 'user'`）不会被误当作用户输入 |
-| 5 | 目录读不到 → 降级为不注入 + 记 warning |
+| 5 | 检索请求失败（连接错误）→ 降级为不注入 + 记 warning |
+| 5b | 检索返回非 2xx（如 401）→ 降级为不注入 |
 | 6 | turn 已取消 → 不注入 |
 | 7 | `apply()` 返回的 disposer 能摘掉监听 |
 
@@ -128,12 +132,24 @@ node test/smoke.mjs
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `maxEntries` | `100` | 最多列出多少项，超出显示 `... (N more not shown)` |
+| `scoreThreshold` | `0.4` | **检索阈值**（0~1，越高要求越相关），随请求体发给 `find` |
+| `limit` | `3` | **检索条数**，随请求体发给 `find` |
 | `maxChars` | `6000` | 注入文本的硬上限 |
-| `timeoutMs` | `3000` | 目录读取超时。**强制项**：pre-step 是被 await 的，卡住多少就加多少首字节延迟 |
-| `dedupeUnchanged` | `true` | 列表未变且旧副本仍在 surface 上时跳过 |
-| `includeHidden` | `false` | 是否包含点开头的条目 |
-| `cwdOverride` | – | 强制指定目录（调试用）；否则用 `agent.session.header.cwd` |
+| `timeoutMs` | `3000` | 检索请求超时。**强制项**：pre-step 是被 await 的，卡住多少就加多少首字节延迟 |
+| `dedupeUnchanged` | `true` | 结果未变且旧副本仍在 surface 上时跳过 |
+
+### OpenViking 连接（当前硬编码）
+
+连接信息暂时写死在 `lib/index.js` 顶部，未走配置：
+
+| 常量 | 当前值 | 说明 |
+|---|---|---|
+| `OV_HOST` | `xxx.xxx.xxx.xxx` | 打码占位，待填真实 host |
+| `OV_PORT` | `1933` | 端口 |
+| `OV_KEY` | （空） | Bearer token。**留空会得到 401，按契约降级为不注入**，不会报错中断 |
+| `OV_USER` / `OV_PEER` | （空）/ `default` | 随 `X-OpenViking-User` / `X-OpenViking-Peer` 头发送 |
+
+只使用 `POST /api/v1/search/find` 这一个接口。
 
 想加 Config schema，用 `@deepseek-ai/schemastery` 或 profile 里可解析的 `zod`，然后 `export const Config = ...`。
 
@@ -147,7 +163,7 @@ node test/smoke.mjs
 |---|---|
 | 进对话记录 | 在 Web UI 里渲染为一条带 `dsh-inject-context` 标签的**注入上下文行**，不是用户气泡 |
 | 占上下文 | 计入 token，参与压缩、上下文压力、会话导出 |
-| 可审计 | 带 `source.kind` / `provider` / `cwd`，能和真人输入区分 |
+| 可审计 | 带 `source.kind` / `provider`（`openviking`），能和真人输入区分 |
 | 不会重放 | 恢复会话时不会重新生成（消息已在历史里） |
 | 压缩后能自愈 | 旧副本被压缩掉后，下一次注入会自动补回 |
 | 不碰系统提示词 | 请求前缀逐字节不变，前缀缓存不受影响 |
@@ -159,7 +175,7 @@ node test/smoke.mjs
 {
   id: randomUUID(),                                  // ← 必填
   role: 'user',
-  source: { kind: 'dsh-inject-context', form: 'snapshot', provider: 'dir', cwd },
+  source: { kind: 'dsh-inject-context', form: 'recall', provider: 'openviking' },
   content: [{ type: 'text', text }],
 }
 ```
@@ -218,7 +234,7 @@ function contextMessage(event, message) {
 ```
 
 - `contextProducer()` 对未知 kind 走 default 分支 → `{ role: 'inject', label: kind }`，所以这一行的标签就是 **`dsh-inject-context`**。
-- `contextForm()` 只认 `instructions` / `catalog` / `snapshot` / `notice` / `relay` / `recall`，其余（含缺省）留给不透明呈现。目录列表用 `'snapshot'`。
+- `contextForm()` 只认 `instructions` / `catalog` / `snapshot` / `notice` / `relay` / `recall`，其余（含缺省）留给不透明呈现。**检索到的记忆用 `'recall'`。**
 
 结论：**注入消息在对话里渲染成一条带来源标签的"注入上下文"行，不是用户气泡。** 不需要额外写 client 半。
 
@@ -235,25 +251,26 @@ function contextMessage(event, message) {
 
 Gate 4 的第二个条件是必需的：内容没变不等于模型还看得到它 —— 压缩可能已经把它挤掉了。判不出来时**一律不跳过**（宁可多发几个 token，也不能让模型丢上下文）。
 
-局限：不跨进程/重启；不做内容级 chunk 去重（对目录列表没意义，换 RAG 才需要）；不跨 session。
+局限：不跨进程/重启；不做内容级 chunk 去重（换 RAG 做 chunk 级召回时才需要）；不跨 session。
 
 ---
 
 ## 已知限制
 
-1. **读目录走 `node:fs`，绕过了 harness 的 `fs` 服务**，因此不受文件沙箱策略约束。样本图的是短；生产版本应当改用 `ctx.fs.resolve()` + `ctx.fs.listDir()`。
-2. **`stillOnSurface()` 会调用 `session.snapshotEvents()` 扫日志**，长会话上是 O(n)。它只在「文本未变、需要判断是否跳过」时才跑，但生产版本应当换成 session projection，而不是扫全量日志。
-3. **单进程内存台账**：`ledger` 按 sessionId 存，`agent/disposed` 时清。跨进程/重启不保留（重启后第一次会重新注入，这是正确行为）。
-4. **`agent.session` 是内部形状**。`Agent` 的公开接口只保证 `id`；这里读的 `session.header.cwd` / `session.snapshotEvents()` / `session.surface.nodes` 都是 harness 内部约定，跨大版本可能需要适配。surface 判定失败时会安全降级为「照常注入」。
+1. **连接信息硬编码**：`OV_HOST` / `OV_PORT` / `OV_KEY` / `OV_USER` / `OV_PEER` 目前写死在 `lib/index.js`，未走配置，也未走 harness 的 HTTP/凭据服务。定稿后应改为读配置。
+2. **直接用全局 `fetch`**：未经过 harness 的网络代理/沙箱策略；超时靠 `timeoutMs` 兜底。
+3. **`stillOnSurface()` 会调用 `session.snapshotEvents()` 扫日志**，长会话上是 O(n)。它只在「文本未变、需要判断是否跳过」时才跑，但生产版本应当换成 session projection，而不是扫全量日志。
+4. **单进程内存台账**：`ledger` 按 sessionId 存，`agent/disposed` 时清。跨进程/重启不保留（重启后第一次会重新注入，这是正确行为）。
+5. **`agent.session` 是内部形状**。`Agent` 的公开接口只保证 `id`；这里读的 `session.snapshotEvents()` / `session.surface.nodes` 都是 harness 内部约定，跨大版本可能需要适配。surface 判定失败时会安全降级为「照常注入」。
 
 ---
 
 ## 换成别的注入源
 
-把 `renderDirListing()` 换成你自己的内容源即可，其余部分（触发闸门、幂等、去重、失败隔离、消息构造）都不需要动：
+本插件当前的注入源就是 **OpenViking `find` 检索**。要换成别的源，把 `renderRetrievedContext()` 换掉即可，其余部分（触发闸门、幂等、去重、失败隔离、消息构造）都不需要动：
 
 ```js
-// 例如：调一个检索服务
+// 例如：换一个检索服务
 const text = await withTimeout(
   fetchFromRetrievalService(query, payload.signal).then(renderChunks),
   config.timeoutMs,
