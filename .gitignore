@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# DSH local profile scratch
+.asar-x/

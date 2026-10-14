@@ -1,0 +1,7 @@
+# Normalize all text files to LF in the repository, regardless of platform.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary

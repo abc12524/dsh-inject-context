@@ -1,0 +1,44 @@
+{
+  "name": "dsh-inject-context",
+  "version": "0.1.0",
+  "description": "Minimal DeepSeek Harness context-injection plugin: appends the session's `dir` output as one standalone user message at agent/pre-step.",
+  "author": "abc12524",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abc12524/dsh-inject-context.git"
+  },
+  "homepage": "https://github.com/abc12524/dsh-inject-context#readme",
+  "bugs": {
+    "url": "https://github.com/abc12524/dsh-inject-context/issues"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "context-injection"
+  ],
+  "license": "MIT"
+}

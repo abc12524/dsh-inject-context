@@ -1,0 +1,10 @@
+# Bundle patch layer for dsh-inject-context.
+#
+# A single `insert` row loads this package's main entry as the host half
+# (a plain Cordis plugin). No `config` is declared here: this package ships no
+# Config schema, so every knob falls back to the defaults in lib/index.js.
+# To override one, add a `config:` block under the row — the raw object is
+# passed straight to `apply(ctx, config)`.
+- insert:
+    - id: dsh-inject-context
+      name: dsh-inject-context
