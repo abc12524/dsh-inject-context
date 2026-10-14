@@ -144,9 +144,9 @@ const credentials = {
 // ---------------------------------------------------------------------------
 
 const BASE_CONFIG = {
-  'ov.host': 'ov.test',
-  'ov.user': 'alice',
-  'ov.apiKeyEnv': 'TEST_KEY',
+  'ovHost': 'ov.test',
+  'ovUser': 'alice',
+  'ovApiKeyEnv': 'TEST_KEY',
 }
 
 function mount(overrides = {}) {
@@ -173,16 +173,16 @@ assert.equal(name, 'dsh-inject-context')
 assert.deepEqual(inject, [], 'the plugin declares no hard service dependency')
 assert.equal(Config.type, 'object')
 
-const VOLATILE_FIELDS = ['enabled', 'ov.host', 'ov.scoreThreshold', 'ov.limit']
+const VOLATILE_FIELDS = ['enabled', 'ovHost', 'ovScoreThreshold', 'ovLimit']
 const ORDINARY_FIELDS = [
   'maxChars',
   'timeoutMs',
   'dedupeUnchanged',
-  'ov.user',
-  'ov.account',
-  'ov.peer',
-  'ov.apiKeyEnv',
-  'ov.abstractChars',
+  'ovUser',
+  'ovAccount',
+  'ovPeer',
+  'ovApiKeyEnv',
+  'ovAbstractChars',
 ]
 
 for (const field of VOLATILE_FIELDS) {
@@ -192,7 +192,7 @@ for (const field of ORDINARY_FIELDS) {
   assert.notEqual(Config.dict[field]?.meta?.volatile, true, `${field} is ordinary configuration, not a form field`)
 }
 assert.equal(
-  Config.dict['ov.apiKeyEnv']?.meta?.role,
+  Config.dict['ovApiKeyEnv']?.meta?.role,
   'credential-ref',
   'the key field names a credential; the literal must never live in configuration',
 )
@@ -205,8 +205,8 @@ assert.equal(
 // A volatile field arrives as a live reference, an ordinary one as a plain
 // value — the two shapes readConfig() has to cover.
 const liveConfig = Config({ ...BASE_CONFIG })
-assert.equal(typeof liveConfig['ov.host']?.get, 'function', 'volatile fields arrive as live references')
-assert.equal(liveConfig['ov.host'].get(), 'ov.test')
+assert.equal(typeof liveConfig['ovHost']?.get, 'function', 'volatile fields arrive as live references')
+assert.equal(liveConfig['ovHost'].get(), 'ov.test')
 assert.equal(typeof liveConfig.timeoutMs, 'number', 'ordinary fields arrive as plain values')
 assert.equal(liveConfig.timeoutMs, 3000)
 
@@ -386,7 +386,7 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
 
 {
   fetchCalls = []
-  const { hook } = mount({ 'ov.host': '' })
+  const { hook } = mount({ 'ovHost': '' })
   const noHost = await runHook(hook, { agent, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   assert.equal(noHost.messages.length, 1)
   assert.equal(fetchCalls.length, 0)
@@ -400,7 +400,7 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
 {
   fetchCalls = []
   fetchImpl = async () => jsonResponse({ result: [] })
-  const { hook } = mount({ 'ov.host': 'https://ov.example.com:8443/' })
+  const { hook } = mount({ 'ovHost': 'https://ov.example.com:8443/' })
   await runHook(hook, { agent: { id: 's2' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   assert.equal(fetchCalls[0]?.url, 'https://ov.example.com:8443/api/v1/search/find')
   console.log('case 8  ok  scheme and port are honoured when typed into the host field')
@@ -413,7 +413,7 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
 {
   fetchCalls = []
   fetchImpl = async () => jsonResponse(MEMORY_BODY)
-  const { hook } = mount({ 'ov.abstractChars': 0 })
+  const { hook } = mount({ 'ovAbstractChars': 0 })
   const whole = await runHook(hook, { agent: { id: 's5' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   const text = whole.messages[1].content[0].text
   assert.ok(text.includes('结尾标记'), 'abstractChars=0 keeps the abstract whole')
@@ -505,8 +505,8 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   await runHook(hook, { agent: { id: 's3' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   assert.equal(JSON.parse(fetchCalls[0].init.body).limit, 3)
 
-  if (typeof config['ov.limit']?.set === 'function') {
-    config['ov.limit'].set(7)
+  if (typeof config['ovLimit']?.set === 'function') {
+    config['ovLimit'].set(7)
     await runHook(hook, { agent: { id: 's4' }, turn: 1, step: 1, signal }, [realUser('u2', 'hi again')])
     assert.equal(
       JSON.parse(fetchCalls[1].init.body).limit,

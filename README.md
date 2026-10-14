@@ -6,9 +6,9 @@
 
 目前内置一个源 —— OpenViking（`ov`）：拿用户输入 `POST /api/v1/search/find`，把记忆包成 recall 块。**再加源只需往 `SOURCES` 注册一个适配器，并在 `Config` 里声明它的 `<id>.*` 配置项**，其余（触发闸门、去重、失败隔离、消息构造、设置页按前缀分组）全部共用。
 
-连接参数（`host`）、相似度阈值、条数在设置页里改；`ov.user` / `ov.account` / `ov.peer` / `ov.abstractChars` 等高级项走普通配置（profile patch），**密钥走 harness 的凭据域，不写进配置文件**。
+连接参数（`host`）、相似度阈值、条数在设置页里改；`ovUser` / `ovAccount` / `ovPeer` / `ovAbstractChars` 等高级项走普通配置（profile patch），**密钥走 harness 的凭据域，不写进配置文件**。
 
-配置按键分组：每个源一节，键名带源前缀（`ov.host`、`ov.scoreThreshold`…），第二个源就是与 `ov` 并列的兄弟键（`dir.root`…）。**用带点的平铺键而不是嵌套对象**是有意的 —— 设置页的 `SettingsFormModel` 只能寻址顶层字段，嵌套的 `sources.ov.host` 在卡片里读不到也写不进（详见「配置与设置页」）。
+配置按键分组：每个源一节，键名带源前缀（`ovHost`、`ovScoreThreshold`…），第二个源就是与 `ov` 并列的兄弟键（`dirRoot`…）。**键名不带点**（用 `ovHost` 而非 `ov.host`）是有意的：设置页的 `SettingsFormModel` 只能寻址顶层字段（嵌套的 `sources.ov.host` 读不到）；而带点的字面量键 `ov.host` 又会在写回 profile patch 时被当成嵌套路径（存成 `ov: { host }`，Config schema 不认 → 保存被拒、读回为空）。无点前缀既保留分组、又能过 patch 往返（详见「配置与设置页」）。
 
 ```
 用户: 我的主题偏好是什么
@@ -130,15 +130,15 @@ node test/smoke.mjs
 
 | 用例 | 断言 |
 |---|---|
-| 1 | `Config` 有 4 个 `.volatile()` 字段（`enabled` + `ov.host` / `ov.scoreThreshold` / `ov.limit`）、`ov.apiKeyEnv` 的 role 是 `credential-ref`、无 secret 字面量；volatile 字段是 `.get()` 引用、普通字段是普通值 |
+| 1 | `Config` 有 4 个 `.volatile()` 字段（`enabled` + `ovHost` / `ovScoreThreshold` / `ovLimit`）、`ovApiKeyEnv` 的 role 是 `credential-ref`、无 secret 字面量；volatile 字段是 `.get()` 引用、普通字段是普通值 |
 | 2 | 首个 step 恰好追加 1 条，既有消息原样透传；`find` 的 URL / 请求头 / `query` / `score_threshold` / `limit` 全部正确；重 uri 去重、按分数降序、超长 abstract 在 `abstractChars` 处截断并标记 |
 | 3 | 工具续跑的 step（claim 为空）→ 不检索也不注入 |
 | 4 | 结果未变且旧副本仍在 surface 上 → 跳过；已被压缩掉 → **必须补回**；session 形状读不出来 → **兜底注入** |
 | 5 | 别的插件的注入（`source.kind !== 'user'`）不会被误当作用户输入 |
 | 6 | `enabled: false` → 完全不碰网络 |
-| 7 | `ov.host` 留空 → 该源不注入不请求 |
+| 7 | `ovHost` 留空 → 该源不注入不请求 |
 | 8 | host 里自带 `https://` 和端口也能正确拼接 |
-| 8b | `ov.abstractChars: 0` → 不截断 |
+| 8b | `ovAbstractChars: 0` → 不截断 |
 | 9 | 401 / 500 / 非 JSON 响应 / 网络错误 / 超时 → 告警 + 降级不注入；**空结果是正常情况，静默** |
 | 10 | turn 已取消 → 不注入 |
 | 11 | 配置按轮读取（live ref），设置页改动下一轮生效 |
@@ -163,32 +163,32 @@ node test/smoke.mjs
 
 ### 设置页字段
 
-设置页按源分组：字段名带源前缀，`ov.*` 是 OpenViking 一组；再加的源会是同级的另一组。**注意用平铺的点号键**（`ov.host`）而非嵌套对象，见文首说明与「已知限制」。
+设置页按源分组：字段名带源前缀，`ovHost` / `ovScoreThreshold` / `ovLimit` 是 OpenViking 一组；再加的源会是同级的另一组。键名**不带点**（见文首说明与「已知限制」）。
 
 | 配置键 | 控件 | 默认 | 说明 |
 |---|---|---|---|
 | `enabled` | 启用注入（开关） | `on` | 关掉后所有源都不跑 |
-| `ov.host` | OV · 主机 | （空） | 格式 `ip:port`（如 `192.168.30.181:1933`），可带 `https://`；不写端口则用缺省 `1933`。留空 = 停用该源 |
+| `ovHost` | OV · 主机 | （空） | 格式 `ip:port`（如 `192.168.30.181:1933`），可带 `https://`；不写端口则用缺省 `1933`。留空 = 停用该源 |
 | 写only控件 | OV · **API Key** | （空） | **写进凭据域**，不落配置文件 |
-| `ov.scoreThreshold` | OV · 相似度阈值 | `0.4` | 见下方实测 |
-| `ov.limit` | OV · 最多条数 | `3` | 每轮请求多少条 |
+| `ovScoreThreshold` | OV · 相似度阈值 | `0.4` | 见下方实测 |
+| `ovLimit` | OV · 最多条数 | `3` | 每轮请求多少条 |
 
 ### 普通配置（profile patch）
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `ov.user` | （空） | `X-OpenViking-User` |
-| `ov.account` | `default` | `X-OpenViking-Account` |
-| `ov.peer` | `default` | `X-OpenViking-Peer` |
-| `ov.apiKeyEnv` | `OPENVIKING_API_KEY` | 密钥的凭据引用名 |
-| `ov.abstractChars` | `1200` | 每条记忆的字符上限；0 = 不截断 |
+| `ovUser` | （空） | `X-OpenViking-User` |
+| `ovAccount` | `default` | `X-OpenViking-Account` |
+| `ovPeer` | `default` | `X-OpenViking-Peer` |
+| `ovApiKeyEnv` | `OPENVIKING_API_KEY` | 密钥的凭据引用名 |
+| `ovAbstractChars` | `1200` | 每条记忆的字符上限；0 = 不截断 |
 | `maxChars` | `6000` | 注入块整体的字符硬上限 |
 | `timeoutMs` | `3000` | 检索超时。**强制**：pre-step 被 await，卡住多少就加多少首字节延迟 |
 | `dedupeUnchanged` | `true` | 结果未变且旧副本仍在 surface 上时跳过 |
 
 ### 密钥为什么不进配置
 
-`ov.apiKeyEnv` 是一个**凭据引用名**（`role('credential-ref')`），真正的密文由 harness 的凭据域持有，落在 `~/.dsh/.credentials.yaml`。设置页只拿到 `{configured, writable}`，**永远读不到密文原文**；Host 半用 `ctx.credentials.resolve(ref)` 取用。
+`ovApiKeyEnv` 是一个**凭据引用名**（`role('credential-ref')`），真正的密文由 harness 的凭据域持有，落在 `~/.dsh/.credentials.yaml`。设置页只拿到 `{configured, writable}`，**永远读不到密文原文**；Host 半用 `ctx.credentials.resolve(ref)` 取用。
 
 这样配置文件里没有秘密，仓库里也没有 —— 对一个公开仓库是必需的。
 
@@ -330,7 +330,7 @@ Gate 4 的第二个条件是必需的：内容没变不等于模型还看得到�
 4. **单进程内存台账**：`ledger` 按 sessionId 存，`agent/disposed` 时清。跨进程/重启不保留（重启后第一次会重新注入，这是正确行为）。
 5. **`agent.session` 是内部形状**。`Agent` 的公开接口只保证 `id`；这里读的 `session.snapshotEvents()` / `session.surface.nodes` 都是 harness 内部约定，跨大版本可能需要适配。surface 判定失败时会安全降级为「照常注入」。
 6. **表单控件只能用 primitives 提供的那几种**。`@deepseek-ai/dsh-client-ui-primitives` 的 settings-form 只导出 `SettingsForm` / `SettingsFormModel` / `settingsTextField` / `settingsNumberField` / `SettingsValueField` / `SettingsSecretField` —— **没有布尔字段**。本插件的"启用"开关是靠自定义一个 `on`/`off` 的字段 spec 配 `Switch` primitive 实现的（见 `lib/client.js` 的 `settingsBooleanField`），因为 `SettingsFormModel` 的字段 spec 本质上只是 `format`/`parse` 一对函数，可以自己写。
-7. **源配置用带点的平铺键分组，而非嵌套对象**。设置页的 `SettingsFormModel` 只能寻址顶层字段（读 `value[field]`、写 `path: [field]`），所以源分组落成字面量点号顶层键 `ov.host`；真嵌套的 `sources.ov.host` 在卡片里读不到、写不进。（host 侧 `dsh-settings` 的 `volatileForm`/`isVolatilePath` 本身支持嵌套与多段路径，但现有手写卡片发不出多段路径。）
+7. **源配置用无点前缀键分组，而非嵌套对象或点号键**。设置页的 `SettingsFormModel` 只能寻址顶层字段（读 `value[field]`、写 `path: [field]`），嵌套的 `sources.ov.host` 读不到；而带点的字面量键 `ov.host` 又会在 profile-patch 编辑器里被当成嵌套路径（存成 `ov: { host }`，Config schema 拒绝 → 保存报「未接受」、读回为空）。因此用 `ovHost` 这种**无点前缀**。（host 侧 `dsh-settings` 的 `volatileForm`/`isVolatilePath` 本身支持嵌套与多段路径，但现有手写卡片发不出多段路径。）
 
 ---
 
@@ -338,20 +338,20 @@ Gate 4 的第二个条件是必需的：内容没变不等于模型还看得到�
 
 通道是可插拔的：注册一个适配器即可，其余全部共用。
 
-1. 在 `Config` 里声明该源的配置项，键名带源前缀（与 `ov.*` 并列），用户面向的字段加 `.volatile()`：
+1. 在 `Config` 里声明该源的配置项，键名带源前缀（与 `ovHost` 等并列且**不带点**），用户面向的字段加 `.volatile()`：
 
    ```js
-   'dir.root': z.string().default('').volatile(),
+   'dirRoot': z.string().default('').volatile(),
    ```
 
 2. 实现适配器并注册进 `SOURCES`：
 
    ```js
    export const dirSource = {
-     id: 'dir',          // 同时作为配置前缀：`dir.*`
+     id: 'dir',          // 源 id；配置项用无点前缀 `dir…`（如 dirRoot）
      provider: 'dir',    // → source.provider
      form: 'snapshot',   // → source.form，客户端认得的形态之一
-     enabled: (config) => String(readConfig(config, 'dir.root', '')).length > 0,
+     enabled: (config) => String(readConfig(config, 'dirRoot', '')).length > 0,
      collect: async (ctx, { query, config, signal }) => {
        // 返回已包好的可注入文本，或 ''（无需注入）；可抛异常，通道会捕获并只降级该源
        return renderDirListing(rootOf(config), query)
@@ -360,7 +360,7 @@ Gate 4 的第二个条件是必需的：内容没变不等于模型还看得到�
    SOURCES.push(dirSource)
    ```
 
-3. 想让它出现在设置页，就在 `lib/client.js` 里照葫芦画瓢加一组字段（spec 用 `'dir.root'` 这种顶层键名），并加一个分组标题。
+3. 想让它出现在设置页，就在 `lib/client.js` 里照葫芦画瓢加一组字段（spec 用 `'dirRoot'` 这种顶层键名），并加一个分组标题。
 
 通道统一负责：只对真实用户输入触发、每 `(session, turn, source, input)` 注入一次、`textHash` + surface 判定的跨轮去重、每源独立超时与失败隔离、`maxChars` 截断、消息构造（`id` / `source.kind` / `provider` / `form`）。
 
