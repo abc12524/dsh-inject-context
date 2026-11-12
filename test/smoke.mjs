@@ -173,7 +173,7 @@ assert.equal(name, 'dsh-inject-context')
 assert.deepEqual(inject, [], 'the plugin declares no hard service dependency')
 assert.equal(Config.type, 'object')
 
-const VOLATILE_FIELDS = ['enabled', 'ovHost', 'ovScoreThreshold', 'ovLimit']
+const VOLATILE_FIELDS = ['enabled', 'userTips', 'ovHost', 'ovScoreThreshold', 'ovLimit']
 const ORDINARY_FIELDS = [
   'maxChars',
   'totalMaxChars',
@@ -193,7 +193,7 @@ const ORDINARY_FIELDS = [
   'skillService',
   'skillListLimit',
   'skillListChars',
-  'userTips',
+
 ]
 
 for (const field of VOLATILE_FIELDS) {
@@ -1001,7 +1001,8 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   const catalog = first.messages[1]
   assert.equal(catalog.source.form, 'catalog')
   const text = catalog.content[0].text
-  assert.match(text, /<available_skills>/)
+  assert.match(text, /<shell_skills>/, 'the catalog uses its own envelope, not tool-skill\'s')
+  assert.doesNotMatch(text, /<available_skills>/, 'the built-in catalog envelope is left untouched')
   assert.match(text, /- `file-tools`: 读写文件/)
   assert.match(text, /- `shell`: 执行命令/)
 
@@ -1010,11 +1011,16 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   const missing = await runHook(noProvider.hook, { agent: { id: 's22b' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   assert.equal(missing.messages.length, 1)
 
-  // Off by default, so a provider alone changes nothing.
-  const off = mount({}, { services: { shellSkills: skills } })
-  const disabled = await runHook(off.hook, { agent: { id: 's22c' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  // On by default, so a provider alone injects the catalog.
+  const on = mount({}, { services: { shellSkills: skills } })
+  const injected = await runHook(on.hook, { agent: { id: 's22c' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  assert.equal(injected.messages.length, 2, 'the catalog rides alongside the user message')
+
+  // An explicit opt-out still wins.
+  const off = mount({ skillList: false }, { services: { shellSkills: skills } })
+  const disabled = await runHook(off.hook, { agent: { id: 's22d' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   assert.equal(disabled.messages.length, 1)
-  console.log('case 22 ok  the skill catalog is read from the provider service and is opt-in')
+  console.log('case 22 ok  the skill catalog is read from the provider service, on by default, in its own envelope')
 }
 
 // ---------------------------------------------------------------------------

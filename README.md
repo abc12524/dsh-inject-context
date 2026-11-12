@@ -8,7 +8,7 @@
 
 | 源 id | form | 默认 | 何时注入 | 内容 |
 |---|---|---|---|---|
-| `skillList` | `catalog` | 关 | 会话首次（日志里还没有 `<available_skills>`） | 从 `shellSkills` 服务读取的已安装/启用 skill 名单 |
+| `skillList` | `catalog` | 开 | 会话首次（日志里还没有 `<shell_skills>`） | 从 `shellSkills` 服务读取的已安装/启用 skill 名单；用独立信封，与 `tool-skill` 的 `<available_skills>` 并行 |
 | `ovProfile` | `catalog` | 关 | 会话首次（日志里还没有索引标记时） | 记忆目录索引，让模型先知道有哪些主题 |
 | `userTips` | `instructions` | 空值即关 | 会话首次 | `<user_tips>`（配置或 `USER_TIPS` 环境变量） |
 | `ov` | `recall` | 跟随 `ovHost` | 每个有真实用户输入的 step；`ovStepRecall` 开启后，工具续跑 step 也会再召回一次 | `POST /api/v1/search/find` 的候选记忆 |
@@ -18,7 +18,7 @@
 
 **再加源只需往 `SOURCES` 注册一个适配器，并在 `Config` 里声明它的 `<id>.*` 配置项**，其余（触发闸门、并发调度、去重、超时取消、字符预算、失败隔离、消息构造）全部共用；想让某个源在工具续跑 step 上也能召回，再声明 `onStep` / `stepEnabled` 即可。兄弟插件可以直接调用导出的 `defineSource()` / `registerSource()`（见「扩展接口」）。
 
-连接参数（`host`）、相似度阈值、条数在设置页里改；`ovUser` / `ovAccount` / `ovPeer` / `ovAbstractChars` / `ovProfile` / `ovStepRecall` 等高级项走普通配置（profile patch），**密钥走 harness 的凭据域，不写进配置文件**。
+连接参数（`host`）、相似度阈值、条数、用户提示（`userTips`）在设置页里改；`ovUser` / `ovAccount` / `ovPeer` / `ovAbstractChars` / `ovProfile` / `ovStepRecall` 等高级项走普通配置（profile patch），**密钥走 harness 的凭据域，不写进配置文件**。
 
 配置按键分组：每个源一节，键名带源前缀（`ovHost`、`ovScoreThreshold`…），第二个源就是与 `ov` 并列的兄弟键（`dirRoot`…）。**键名不带点**（用 `ovHost` 而非 `ov.host`）是有意的：设置页的 `SettingsFormModel` 只能寻址顶层字段（嵌套的 `sources.ov.host` 读不到）；而带点的字面量键 `ov.host` 又会在写回 profile patch 时被当成嵌套路径（存成 `ov: { host }`，Config schema 不认 → 保存被拒、读回为空）。无点前缀既保留分组、又能过 patch 往返（详见「配置与设置页」）。
 
@@ -222,6 +222,7 @@ node test/smoke.mjs
 | 配置键 | 控件 | 默认 | 说明 |
 |---|---|---|---|
 | `enabled` | 启用注入（开关） | `on` | 关掉后所有源都不跑 |
+| `userTips` | 用户提示 · 文本 | （空） | 每会话注入一次（`<user_tips>`）；留空时回退 `user_tips` / `USER_TIPS` 环境变量 |
 | `ovHost` | OV · 主机 | （空） | 格式 `ip:port`（如 `192.168.30.181:1933`），可带 `https://`；不写端口则用缺省 `1933`。留空 = 停用该源 |
 | 写only控件 | OV · **API Key** | （空） | **写进凭据域**，不落配置文件 |
 | `ovScoreThreshold` | OV · 相似度阈值 | `0.4` | 见下方实测 |
@@ -241,11 +242,10 @@ node test/smoke.mjs
 | `ovProfileChars` | `2000` | 索引块字符上限；0 = 不截断 |
 | `ovStepRecall` | `false` | 工具续跑 step 也召回一次（query = 本轮用户文本 + 工具结果） |
 | `ovStepQueryChars` | `2000` | step 召回 query 的字符上限 |
-| `skillList` | `false` | 会话首次注入外部 skill 名单（`catalog`）；与 harness `tool-skill` 的目录互斥，别同时开 |
+| `skillList` | `true` | 会话首次注入外部 skill 名单（`catalog`）；用独立 `<shell_skills>` 信封，与 harness `tool-skill` 的目录**并行**，互不覆盖 |
 | `skillService` | `shellSkills` | 提供 skill 名单的 Cordis 服务名（`{ list() }`） |
 | `skillListLimit` | `50` | 名单最多列多少条 |
 | `skillListChars` | `4000` | 名单块字符上限；0 = 不截断 |
-| `userTips` | （空） | 每会话注入一次的 `<user_tips>`；留空时回退 `user_tips` / `USER_TIPS` 环境变量 |
 | `maxChars` | `6000` | **每条**注入消息的字符硬上限 |
 | `totalMaxChars` | `0` | **一次 step 全部注入**的字符上限；0 = 不限。按注册顺序分配 |
 | `timeoutMs` | `3000` | 检索超时。**强制**：pre-step 被 await，卡住多少就加多少首字节延迟；超时会同时 abort 请求 |
@@ -399,7 +399,7 @@ Gate 4 的第二个条件是必需的：内容没变不等于模型还看得到�
 4. **内存台账只是快路径**：`ledger` 按 sessionId 存，`agent/disposed` 时清。跨进程/重启不保留 —— 正确性由 Gate 4 的日志推导兜底，不依赖它。
 5. **`agent.session` 是内部形状**。`Agent` 的公开接口只保证 `id`；这里读的 `session.snapshotEvents()` / `session.surface.nodes` / `turn/start` / `tool/result` 事件结构都是 harness 内部约定，跨大版本可能需要适配。读不出来时安全降级为「照常注入」（step 召回则降级为「本轮不召回」）。
 6. **`ovProfile` 依赖 `ovUser`**：记忆根是 `viking://user/<ovUser>/peers/<ovPeer>/memories/`，用户名留空就没有可寻址的根，索引源自动不生效。
-7. **`skillList` 与 harness `tool-skill` 互斥**：`tool-skill` 自己会发布 `skill-catalog`（同样的 `<available_skills>` 标记）。两者同开会让模型收到两份名单；本插件的源默认关闭，且只把**自己**落过的消息当作"已注入"。
+7. **`skillList` 与 harness `tool-skill` 并行**：`tool-skill` 发布 `<available_skills>`，本插件发布独立的 `<shell_skills>`，两者同时开时模型会收到两份来源不同的名单，但各自只认自己的信封，不会互相覆盖或抑制。名单只在会话首次注入一次；provider 缺失时安全跳过。
 8. **`userWarning` 只在能构造出 query 的 step 上注入**：step 模式需要「本轮用户文本 + 工具结果」非空才会走到源调度；若某个续跑步完全没有可读文本，队列会留到下一个可注入的 step，而不是丢掉。
 9. **表单控件只能用 primitives 提供的那几种**。`@deepseek-ai/dsh-client-ui-primitives` 的 settings-form 只导出 `SettingsForm` / `SettingsFormModel` / `settingsTextField` / `settingsNumberField` / `SettingsValueField` / `SettingsSecretField` —— **没有布尔字段**。本插件的"启用"开关是靠自定义一个 `on`/`off` 的字段 spec 配 `Switch` primitive 实现的（见 `lib/client.js` 的 `settingsBooleanField`），因为 `SettingsFormModel` 的字段 spec 本质上只是 `format`/`parse` 一对函数，可以自己写。
 10. **源配置用无点前缀键分组，而非嵌套对象或点号键**。设置页的 `SettingsFormModel` 只能寻址顶层字段（读 `value[field]`、写 `path: [field]`），嵌套的 `sources.ov.host` 读不到；而带点的字面量键 `ov.host` 又会在 profile-patch 编辑器里被当成嵌套路径（存成 `ov: { host }`，Config schema 拒绝 → 保存报「未接受」、读回为空）。因此用 `ovHost` 这种**无点前缀**。（host 侧 `dsh-settings` 的 `volatileForm`/`isVolatilePath` 本身支持嵌套与多段路径，但现有手写卡片发不出多段路径。）
@@ -427,21 +427,23 @@ ctx.set('shellSkills', {
 })
 ```
 
-在本插件的 profile patch 里打开：
+默认已开启。要关掉或换 provider，在 profile patch 里写：
 
 ```yaml
 - id: dsh-inject-context
   name: dsh-inject-context
   config:
-    skillList: true
+    skillList: false            # 默认 true；显式关闭
     skillService: shellSkills   # 默认值
 ```
 
 - 名单每**会话**注入一次（`catalog`），provider 只在首次 eligible step 被调用
 - 返回数组 / `{ entries }` / `{ skills }` 都可以；项可只给 `name`，也可给 `{ name, description }`
-- **不要**与 harness `tool-skill` 同开：它自己也会发布 `<available_skills>` 名单
+- **与** harness `tool-skill` **并行**：本插件用 `<shell_skills>`，`tool-skill` 用 `<available_skills>`，两套名单同时到达模型且互不覆盖
 
 ### user_tips
+
+在 Plugins 页面本插件的「用户提示」输入框里填，或写 profile patch：
 
 ```yaml
 config:
