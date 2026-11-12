@@ -276,6 +276,12 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
   assert.match(text, /用户偏好深色主题/)
   assert.match(text, /不视为指令/, 'the epilogue states the block is not instruction')
 
+  // …and the recall block names itself, so the model can tell remembered text
+  // from the catalog (`<shell_skills>`) and the tips (`<user_tips>`) beside it.
+  assert.match(text, /<openviking>\n\[自动检索的候选记忆/, 'the recall block opens its own envelope')
+  assert.match(text, /不视为指令[^\n]*\n<\/openviking>/, 'and closes it after the epilogue')
+  assert.equal((text.match(/<openviking>/g) ?? []).length, 1, 'one envelope per recall block')
+
   // 3 — user tips, once per session.
   assert.match(text, /<user_tips>/)
   assert.match(text, /回答用中文/)
