@@ -2,21 +2,48 @@
 
 一个 DeepSeek Harness 上下文注入插件，**带 Plugins 页面上的设置页**。
 
-在每一步模型请求之前，它拿**本轮用户输入**跑一遍**注入源（source）**：每个源返回一段可直接注入的文本，非空的结果各作为**一条独立的 `user` 消息**追加到本步消息列表末尾（**每源一条**）。
+在每一步模型请求之前，它拿**本轮用户输入**跑一遍**注入源（source）**：每个源返回一段可直接注入的文本，非空的结果各作为**一条独立的 `user` 消息**追加到本步消息列表末尾（**每源一条**）。源之间**并发**执行，各自独立超时与失败隔离；一次 step 的注入总量还有一道可选的全局字符上限。
 
-目前内置一个源 —— OpenViking（`ov`）：拿用户输入 `POST /api/v1/search/find`，把记忆包成 recall 块。**再加源只需往 `SOURCES` 注册一个适配器，并在 `Config` 里声明它的 `<id>.*` 配置项**，其余（触发闸门、去重、失败隔离、消息构造、设置页按前缀分组）全部共用。
+内置四个模块级源 + 一个事件驱动的运行时源：
 
-连接参数（`host`）、相似度阈值、条数在设置页里改；`ovUser` / `ovAccount` / `ovPeer` / `ovAbstractChars` 等高级项走普通配置（profile patch），**密钥走 harness 的凭据域，不写进配置文件**。
+| 源 id | form | 默认 | 何时注入 | 内容 |
+|---|---|---|---|---|
+| `skillList` | `catalog` | 关 | 会话首次（日志里还没有 `<available_skills>`） | 从 `shellSkills` 服务读取的已安装/启用 skill 名单 |
+| `ovProfile` | `catalog` | 关 | 会话首次（日志里还没有索引标记时） | 记忆目录索引，让模型先知道有哪些主题 |
+| `userTips` | `instructions` | 空值即关 | 会话首次 | `<user_tips>`（配置或 `USER_TIPS` 环境变量） |
+| `ov` | `recall` | 跟随 `ovHost` | 每个有真实用户输入的 step；`ovStepRecall` 开启后，工具续跑 step 也会再召回一次 | `POST /api/v1/search/find` 的候选记忆 |
+| `userWarning` | `notice` | 常开（队列空则无动作） | 收到 `dsh-inject-context/warning` 事件后的下一个 step | `<user_warning>`，注入即消费 |
+
+前四个是模块级源（`SOURCES`），`userWarning` 是每个插件实例自带的队列源 —— 告警是瞬时通知，不属于会话状态。
+
+**再加源只需往 `SOURCES` 注册一个适配器，并在 `Config` 里声明它的 `<id>.*` 配置项**，其余（触发闸门、并发调度、去重、超时取消、字符预算、失败隔离、消息构造）全部共用；想让某个源在工具续跑 step 上也能召回，再声明 `onStep` / `stepEnabled` 即可。兄弟插件可以直接调用导出的 `defineSource()` / `registerSource()`（见「扩展接口」）。
+
+连接参数（`host`）、相似度阈值、条数在设置页里改；`ovUser` / `ovAccount` / `ovPeer` / `ovAbstractChars` / `ovProfile` / `ovStepRecall` 等高级项走普通配置（profile patch），**密钥走 harness 的凭据域，不写进配置文件**。
 
 配置按键分组：每个源一节，键名带源前缀（`ovHost`、`ovScoreThreshold`…），第二个源就是与 `ov` 并列的兄弟键（`dirRoot`…）。**键名不带点**（用 `ovHost` 而非 `ov.host`）是有意的：设置页的 `SettingsFormModel` 只能寻址顶层字段（嵌套的 `sources.ov.host` 读不到）；而带点的字面量键 `ov.host` 又会在写回 profile patch 时被当成嵌套路径（存成 `ov: { host }`，Config schema 不认 → 保存被拒、读回为空）。无点前缀既保留分组、又能过 patch 往返（详见「配置与设置页」）。
+
+`ovProfile` 与 `ov` 同属一套 OpenViking 连接，所以它**不引入新的前缀键**，直接复用 `ovHost` / `ovUser` / `ovPeer` / `ovApiKeyEnv`。只有需要独立连接的新源才引入自己的前缀。
 
 ```
 用户: 我的主题偏好是什么
        ↓
-[agent/pre-step]  dsh-inject-context 取用户问题 → POST /api/v1/search/find → 包裹 recall 块 → 追加一条 user 消息
+[agent/pre-step]  dsh-inject-context 并发跑各源：
+       ├─ skillList   （会话首次，可选）→ shellSkills.list()          → skill 名单（catalog）
+       ├─ ovProfile   （会话首次，可选）→ GET /api/v1/fs/tree         → 记忆索引（catalog）
+       ├─ userTips    （会话首次，可选）→ 配置 / USER_TIPS             → <user_tips>（instructions）
+       ├─ ov          → POST /api/v1/search/find → recall 块（recall）
+       └─ userWarning （有事件时）→ <user_warning>（notice）
        ↓
-模型实际收到:  [用户消息] [runtime-context] [【自动检索的候选记忆…】…【检索结束…】]
-                                              ↑ 本插件注入
+模型实际收到:  [用户消息] [runtime-context] [skill 名单] [记忆索引] [user_tips] [候选记忆…] [warning]
+                                               ↑ 本插件注入（每源一条）
+```
+
+工具续跑时（`ovStepRecall: true`）：
+
+```
+[用户消息] [runtime-context] [assistant(tool_call)] [tool 结果]
+                                                       ↓ 下一次 pre-step
+                             query = 本轮用户文本 + 工具结果 → 再召回 → 追加一条 user 消息
 ```
 
 ---
@@ -34,6 +61,8 @@
 | 5 | **异常一律降级为"不注入"** —— 超时、HTTP 非 2xx、取消、畸形响应都不会打断这一轮对话 |
 
 第 3 条是这个设计的最大好处：系统提示词注入会**每一步都在改请求前缀**，持续破坏提示词缓存；而消息尾部追加只影响请求末尾，前缀缓存完全不受影响。
+
+**默认只对真实用户输入触发**（`source.kind === 'user'` 的消息）。工具续跑 step 默认不检索；开启 `ovStepRecall` 后，声明了 `onStep` 的源才会用「本轮用户文本 + 工具结果」再召回一次。这是显式 opt-in，不是默认行为。
 
 ---
 
@@ -102,17 +131,22 @@ bundle 会让 harness 自动应用包内的 `cordis.patch.yml`，把插件条目
 
 无需构建步骤：`lib/index.js`（宿主半）和 `lib/client.js`（浏览器半）都是最终产物。浏览器半是手写的 `window.__ModuleLoader__.load({ id, factory })` 包装，`require` 由运行时 loader 注入 —— 不需要打包器。
 
-### 为什么插件能 `import '@deepseek-ai/schemastery'`
+### 为什么插件能 `import '@deepseek-ai/schemastery'` / `'@deepseek-ai/dsh-llm'`
 
-`@deepseek-ai/*` 包**并不在 profile 的 `node_modules` 里**（profile 用 `nodeLinker: hoisted`，只会平铺 profile 自己声明的依赖）。所以本包把它声明成 `peerDependencies`：
+`@deepseek-ai/*` 包**并不在 profile 的 `node_modules` 里**（profile 用 `nodeLinker: hoisted`，只会平铺 profile 自己声明的依赖）。所以本包把它们声明成 `peerDependencies`：
 
 ```json
-"peerDependencies": { "@deepseek-ai/schemastery": "^3.18.2" }
+"peerDependencies": {
+  "@deepseek-ai/dsh-llm": ">=0.0.1-rc.1",
+  "@deepseek-ai/schemastery": "^3.18.2"
+}
 ```
 
 `dsh-app-boot` 会装一个 **profile 解析引导**（`lib/worker/profile-resolution-bootstrap.js`），劫持 Node 的 ESM 与 CJS 解析器：它沿插件文件向上找 `package.json`、读其中的 `peerDependencies`，命中就把这个 import **路由到 harness 自己的那份副本**。dsh-context 能用 `@deepseek-ai/schemastery` 正是同一机制 —— 这也是为什么 profile 的 `pnpm-workspace.yaml` 故意写着 `autoInstallPeers: false`。
 
-同一份声明也进了 `devDependencies`，只为了让 `node test/smoke.mjs` 在没有 harness 的环境里也能用真实 schemastery 跑起来；生产安装不会拉它（pnpm 不装被依赖包的 devDependencies）。
+同一份声明也进了 `devDependencies`，只为了让 `node test/smoke.mjs` 在没有 harness 的环境里也能用真实 schemastery / dsh-llm 跑起来；生产安装不会拉它（pnpm 不装被依赖包的 devDependencies）。
+
+`@deepseek-ai/dsh-llm` 只用到一个导出：`createUserMessage()`。注入消息必须由它构造（自动补 `id` 并深冻结），原因见下文「消息为什么必须长这样」。
 
 ---
 
@@ -142,9 +176,19 @@ node test/smoke.mjs
 | 9 | 401 / 500 / 非 JSON 响应 / 网络错误 / 超时 → 告警 + 降级不注入；**空结果是正常情况，静默** |
 | 10 | turn 已取消 → 不注入 |
 | 11 | 配置按轮读取（live ref），设置页改动下一轮生效 |
-| 12 | `apply()` 返回的 disposer 摘掉全部两个监听 |
+| 12 | `apply()` 返回的 disposer 摘掉全部监听（pre-step / disposed / warning 事件） |
 | 13 | 浏览器半注册 `plugins.bundle.config`，**key 等于包名**；语言包齐备；summary 视图可用 |
 | 14 | 注册第二个源后，两个源**各追加一条**消息、各带自己的 `provider`/`form`，走同一条通道 |
+| 15 | 两个源**并发**执行（第二个源在第一个 `await` 期间就已启动），输出仍按注册顺序 |
+| 16 | 超时的源不仅"不再等待"，请求本身被 `AbortSignal` 中止 |
+| 17 | `totalMaxChars` 按注册顺序发放预算：第一个源用满，第二个源只拿到剩余额度 |
+| 18 | **跨重启去重**：全新 `apply`（空台账）面对日志里已有的同文本注入 → 跳过 |
+| 19 | 记忆索引是独立的 `catalog` 消息；会话日志已有索引时不再重建（`/fs/tree` 只请求一次） |
+| 20 | `ovStepRecall` 开启后工具续跑 step 用「用户文本 + 工具结果」再召回；同一 step 只召回一次；默认关闭 |
+| 21 | `userTips` 每会话只注入一次；配置为空时回退 `USER_TIPS` 环境变量 |
+| 22 | skill 名单从 `shellSkills` 服务的 `list()` 读取；无服务不注入；`skillList` 默认关闭 |
+| 23 | `dsh-inject-context/warning` 事件推入的告警，在下一次 pre-step 以 `notice` 注入（带 `summary`），注入即消费 |
+| 24 | `defineSource()` 校验必填字段；`registerSource()` 返回的 disposer 能注销 |
 
 ---
 
@@ -177,13 +221,24 @@ node test/smoke.mjs
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `ovUser` | （空） | `X-OpenViking-User` |
+| `ovUser` | （空） | `X-OpenViking-User`；**记忆索引与 peer 记忆根都依赖它**，留空则 `ovProfile` 不生效 |
 | `ovAccount` | `default` | `X-OpenViking-Account` |
 | `ovPeer` | `default` | `X-OpenViking-Peer` |
 | `ovApiKeyEnv` | `OPENVIKING_API_KEY` | 密钥的凭据引用名 |
 | `ovAbstractChars` | `1200` | 每条记忆的字符上限；0 = 不截断 |
-| `maxChars` | `6000` | 注入块整体的字符硬上限 |
-| `timeoutMs` | `3000` | 检索超时。**强制**：pre-step 被 await，卡住多少就加多少首字节延迟 |
+| `ovProfile` | `false` | 会话首次注入记忆索引（独立 `catalog` 消息） |
+| `ovProfileLimit` | `40` | 索引最多列多少条 |
+| `ovProfileChars` | `2000` | 索引块字符上限；0 = 不截断 |
+| `ovStepRecall` | `false` | 工具续跑 step 也召回一次（query = 本轮用户文本 + 工具结果） |
+| `ovStepQueryChars` | `2000` | step 召回 query 的字符上限 |
+| `skillList` | `false` | 会话首次注入外部 skill 名单（`catalog`）；与 harness `tool-skill` 的目录互斥，别同时开 |
+| `skillService` | `shellSkills` | 提供 skill 名单的 Cordis 服务名（`{ list() }`） |
+| `skillListLimit` | `50` | 名单最多列多少条 |
+| `skillListChars` | `4000` | 名单块字符上限；0 = 不截断 |
+| `userTips` | （空） | 每会话注入一次的 `<user_tips>`；留空时回退 `user_tips` / `USER_TIPS` 环境变量 |
+| `maxChars` | `6000` | **每条**注入消息的字符硬上限 |
+| `totalMaxChars` | `0` | **一次 step 全部注入**的字符上限；0 = 不限。按注册顺序分配 |
+| `timeoutMs` | `3000` | 检索超时。**强制**：pre-step 被 await，卡住多少就加多少首字节延迟；超时会同时 abort 请求 |
 | `dedupeUnchanged` | `true` | 结果未变且旧副本仍在 surface 上时跳过 |
 
 ### 密钥为什么不进配置
@@ -238,16 +293,18 @@ node test/smoke.mjs
 
 ### 消息为什么必须长这样
 
+注入消息由本体提供的 `createUserMessage()` 构造（`@deepseek-ai/dsh-llm`），它做的事就是下面这些字段 + 深冻结：
+
 ```js
-{
-  id: randomUUID(),                                  // ← 必填
-  role: 'user',
+createUserMessage({
   source: { kind: 'dsh-inject-context', form: 'recall', provider: 'openviking' },
   content: [{ type: 'text', text }],
-}
+})
+// → { id: <randomUUID>, role: 'user', source, content } 且整条被 Object.freeze
 ```
 
-- **`id` 必填**：`@deepseek-ai/dsh-session` 的 `assertMessageEventShape` 会拒绝没有非空字符串 `id` 的消息 —— 少写就是运行时 `throw`。
+- **`id` 必填**：`@deepseek-ai/dsh-session` 的 `assertMessageEventShape` 会拒绝没有非空字符串 `id` 的消息 —— 少写就是运行时 `throw`。官方构造器负责生成它。
+- **必须冻结**：本体把每条落盘消息当不可变值使用（`RuntimeContextProjection`、surface 折叠都依赖这一点）；手写对象虽然能通过校验，但不满足这条约定。
 - **`source.kind` 可以用自定义值**：该校验只对 `system` / `assistant` / `tool` 的 kind 做枚举约束，`user/message` 的 kind 是开放的（harness 自己的动态上下文就用了 `'runtime-context'` 这个不在类型表里的值）。
 - **`source.kind` 决定 UI 怎么渲染**（见下节）。
 - **不要复用 `'runtime-context'`**：那个 kind 被 `RuntimeContextProjection` 用来做快照比对和替换链追踪，复用会被误清。
@@ -309,28 +366,118 @@ function contextMessage(event, message) {
 
 ## 去重
 
-两层，都在插件内存里：
+一层内存快路径 + 一层日志推导，后者负责正确性：
 
-| 闸门 | 键 | 挡住什么 |
-|---|---|---|
-| Gate 2 | `(sessionId, turn, queryHash)` | 同一个 turn 内多步（工具调用往复）重复注入 |
-| Gate 4 | `textHash` 未变 **且** 旧副本仍在 `session.surface.nodes` 上 | 跨 turn 的重复注入 |
+| 闸门 | 键 | 位置 | 挡住什么 |
+|---|---|---|---|
+| Gate 2 | `(turn, step, source, mode, queryHash)` | 进程内 `ledger` | 同一个 turn/step 重复注入 —— 命中时**连检索都不发** |
+| Gate 4 | `textHash` 未变 **且** 同文本的旧副本仍在 `session.surface.nodes` 上 | **持久化日志**（`session.snapshotEvents()`） | 跨 turn、**跨重启**的重复注入 |
 
 Gate 4 的第二个条件是必需的：内容没变不等于模型还看得到它 —— 压缩可能已经把它挤掉了。判不出来时**一律不跳过**（宁可多发几个 token，也不能让模型丢上下文）。
 
-局限：不跨进程/重启；不做内容级 chunk 去重（换 RAG 做 chunk 级召回时才需要）；不跨 session。
+为什么第二条要读日志而不是只查内存：`ledger` 随进程消失，但会话日志不会。重启后第一次遇到的注入会重新检索（Gate 2 无法命中），Gate 4 再发现"同样文本已经在 surface 上"并跳过 —— 这就是去重跨重启的方式，也让 `ovProfile` 的"每会话一次"在恢复会话后依然成立（它扫的是日志里的索引标记）。
+
+局限：不跨 session；不做内容级 chunk 去重（换 RAG 做 chunk 级召回时才需要）；Gate 4 的日志扫描是 O(n)。
 
 ---
 
 ## 已知限制
 
-1. **直接用全局 `fetch`**：未经过 harness 的网络代理/沙箱策略；超时靠 `timeoutMs` 兜底。
-2. **只实现 `find`**：OpenViking 还有 `search`（带会话上下文）等接口，本插件只用了无上下文的向量 `find`。
-3. **`stillOnSurface()` 会调用 `session.snapshotEvents()` 扫日志**，长会话上是 O(n)。它只在「文本未变、需要判断是否跳过」时才跑，但生产版本应当换成 session projection，而不是扫全量日志。
-4. **单进程内存台账**：`ledger` 按 sessionId 存，`agent/disposed` 时清。跨进程/重启不保留（重启后第一次会重新注入，这是正确行为）。
-5. **`agent.session` 是内部形状**。`Agent` 的公开接口只保证 `id`；这里读的 `session.snapshotEvents()` / `session.surface.nodes` 都是 harness 内部约定，跨大版本可能需要适配。surface 判定失败时会安全降级为「照常注入」。
-6. **表单控件只能用 primitives 提供的那几种**。`@deepseek-ai/dsh-client-ui-primitives` 的 settings-form 只导出 `SettingsForm` / `SettingsFormModel` / `settingsTextField` / `settingsNumberField` / `SettingsValueField` / `SettingsSecretField` —— **没有布尔字段**。本插件的"启用"开关是靠自定义一个 `on`/`off` 的字段 spec 配 `Switch` primitive 实现的（见 `lib/client.js` 的 `settingsBooleanField`），因为 `SettingsFormModel` 的字段 spec 本质上只是 `format`/`parse` 一对函数，可以自己写。
-7. **源配置用无点前缀键分组，而非嵌套对象或点号键**。设置页的 `SettingsFormModel` 只能寻址顶层字段（读 `value[field]`、写 `path: [field]`），嵌套的 `sources.ov.host` 读不到；而带点的字面量键 `ov.host` 又会在 profile-patch 编辑器里被当成嵌套路径（存成 `ov: { host }`，Config schema 拒绝 → 保存报「未接受」、读回为空）。因此用 `ovHost` 这种**无点前缀**。（host 侧 `dsh-settings` 的 `volatileForm`/`isVolatilePath` 本身支持嵌套与多段路径，但现有手写卡片发不出多段路径。）
+1. **直接用全局 `fetch`**：未经过 harness 的网络代理/沙箱策略；超时由 `timeoutMs` 兜底，且该超时会通过 `AbortSignal` 真正中止请求（不只是停止等待）。
+2. **只实现 `find`**：OpenViking 还有 `search`（带会话上下文）等接口，本插件只用了无上下文的向量 `find`。step 召回是"把工具结果拼进 query"，不是 `search`。
+3. **`injectedOnSurface()` 会调用 `session.snapshotEvents()` 扫日志**，长会话上是 O(n)。它只在「需要判断是否跳过（跨轮去重）」和「判断索引是否已注入」时跑；生产版本换成 session projection 会更好，但那需要引入 `sessionProjections` 服务依赖（与契约 4 冲突），当前用零依赖换可接受的开销。
+4. **内存台账只是快路径**：`ledger` 按 sessionId 存，`agent/disposed` 时清。跨进程/重启不保留 —— 正确性由 Gate 4 的日志推导兜底，不依赖它。
+5. **`agent.session` 是内部形状**。`Agent` 的公开接口只保证 `id`；这里读的 `session.snapshotEvents()` / `session.surface.nodes` / `turn/start` / `tool/result` 事件结构都是 harness 内部约定，跨大版本可能需要适配。读不出来时安全降级为「照常注入」（step 召回则降级为「本轮不召回」）。
+6. **`ovProfile` 依赖 `ovUser`**：记忆根是 `viking://user/<ovUser>/peers/<ovPeer>/memories/`，用户名留空就没有可寻址的根，索引源自动不生效。
+7. **`skillList` 与 harness `tool-skill` 互斥**：`tool-skill` 自己会发布 `skill-catalog`（同样的 `<available_skills>` 标记）。两者同开会让模型收到两份名单；本插件的源默认关闭，且只把**自己**落过的消息当作"已注入"。
+8. **`userWarning` 只在能构造出 query 的 step 上注入**：step 模式需要「本轮用户文本 + 工具结果」非空才会走到源调度；若某个续跑步完全没有可读文本，队列会留到下一个可注入的 step，而不是丢掉。
+9. **表单控件只能用 primitives 提供的那几种**。`@deepseek-ai/dsh-client-ui-primitives` 的 settings-form 只导出 `SettingsForm` / `SettingsFormModel` / `settingsTextField` / `settingsNumberField` / `SettingsValueField` / `SettingsSecretField` —— **没有布尔字段**。本插件的"启用"开关是靠自定义一个 `on`/`off` 的字段 spec 配 `Switch` primitive 实现的（见 `lib/client.js` 的 `settingsBooleanField`），因为 `SettingsFormModel` 的字段 spec 本质上只是 `format`/`parse` 一对函数，可以自己写。
+10. **源配置用无点前缀键分组，而非嵌套对象或点号键**。设置页的 `SettingsFormModel` 只能寻址顶层字段（读 `value[field]`、写 `path: [field]`），嵌套的 `sources.ov.host` 读不到；而带点的字面量键 `ov.host` 又会在 profile-patch 编辑器里被当成嵌套路径（存成 `ov: { host }`，Config schema 拒绝 → 保存报「未接受」、读回为空）。因此用 `ovHost` 这种**无点前缀**。（host 侧 `dsh-settings` 的 `volatileForm`/`isVolatilePath` 本身支持嵌套与多段路径，但现有手写卡片发不出多段路径。）
+
+---
+
+## 扩展接口
+
+三类上下文都留了稳定接口，兄弟插件接入时不需要改本插件的源码。
+
+### skill 名单（`skillList`）
+
+由运行 shell-skills 的插件发布一个 Cordis 服务，本插件只读它的输出：
+
+```js
+// 在 skill 运行器插件里
+ctx.set('shellSkills', {
+  async list({ agent, signal }) {
+    // 只返回「已安装且启用」的 skill；过滤是 provider 的职责
+    return [
+      { name: 'shell', description: '执行系统命令' },
+      { name: 'file-tools', description: '读写文件' },
+    ]
+  },
+})
+```
+
+在本插件的 profile patch 里打开：
+
+```yaml
+- id: dsh-inject-context
+  name: dsh-inject-context
+  config:
+    skillList: true
+    skillService: shellSkills   # 默认值
+```
+
+- 名单每**会话**注入一次（`catalog`），provider 只在首次 eligible step 被调用
+- 返回数组 / `{ entries }` / `{ skills }` 都可以；项可只给 `name`，也可给 `{ name, description }`
+- **不要**与 harness `tool-skill` 同开：它自己也会发布 `<available_skills>` 名单
+
+### user_tips
+
+```yaml
+config:
+  userTips: |
+    回答用中文。
+    引用文件时给出路径。
+```
+
+或由网关设置环境变量（与 shell-tool 的约定一致）：
+
+```sh
+USER_TIPS="这条消息来自 QQ，请用 qq_reply 回复"
+```
+
+每会话一次，`<user_tips>` 包裹，`instructions` form。
+
+### user_warning
+
+任意插件在需要提醒模型时 emit：
+
+```js
+ctx.emit('dsh-inject-context/warning', {
+  agent,                    // 目标 Agent；agentId 也接受
+  text: '工具调用已达上限，不要再调用工具。',
+})
+```
+
+本插件把它排入该 agent 的队列，下一次 `agent/pre-step` 注入一条 `notice`（`<user_warning>`，带 `summary`），注入即消费。没有 emit 就什么都不发生。
+
+### 自定义源
+
+```js
+import { defineSource, registerSource } from 'dsh-inject-context'
+
+const off = registerSource(defineSource({
+  id: 'mySource',
+  provider: 'my-plugin',
+  form: 'notice',
+  enabled: (config) => true,
+  collect: async (ctx, { query, config, signal, session, agent, turn, step, mode }) => '',
+  summary: 'one-line account',    // notice 必填（字符串或 (text) => string）
+}))
+// 卸载：off()
+```
+
+`collect` 的完整入参：`{ query, config, signal, session, agent, turn, step, mode }`。通道负责并发、超时、预算、去重与消息构造；源只负责"返回一段文本或空"。
 
 ---
 
@@ -344,7 +491,7 @@ Gate 4 的第二个条件是必需的：内容没变不等于模型还看得到�
    'dirRoot': z.string().default('').volatile(),
    ```
 
-2. 实现适配器并注册进 `SOURCES`：
+2. 实现适配器并注册：
 
    ```js
    export const dirSource = {
@@ -352,22 +499,32 @@ Gate 4 的第二个条件是必需的：内容没变不等于模型还看得到�
      provider: 'dir',    // → source.provider
      form: 'snapshot',   // → source.form，客户端认得的形态之一
      enabled: (config) => String(readConfig(config, 'dirRoot', '')).length > 0,
-     collect: async (ctx, { query, config, signal }) => {
+     // 可选：让该源在工具续跑 step 上也能召回
+     onStep: true,
+     stepEnabled: (config) => readConfig(config, 'dirStepRecall', false) === true,
+     collect: async (ctx, { query, config, signal, session, agent, turn, step, mode }) => {
        // 返回已包好的可注入文本，或 ''（无需注入）；可抛异常，通道会捕获并只降级该源
+       // mode 为 'turn'（真实用户输入）或 'step'（工具续跑）
        return renderDirListing(rootOf(config), query)
      },
    }
-   SOURCES.push(dirSource)
    ```
+
+   ```js
+   import { registerSource } from 'dsh-inject-context'
+   const off = registerSource(dirSource)   // 卸载时调用 off()
+   ```
+
+   也可以直接 `SOURCES.push(dirSource)`，但那样没有注销句柄；`registerSource()` 会先跑一遍 `defineSource()` 校验。
 
 3. 想让它出现在设置页，就在 `lib/client.js` 里照葫芦画瓢加一组字段（spec 用 `'dirRoot'` 这种顶层键名），并加一个分组标题。
 
-通道统一负责：只对真实用户输入触发、每 `(session, turn, source, input)` 注入一次、`textHash` + surface 判定的跨轮去重、每源独立超时与失败隔离、`maxChars` 截断、消息构造（`id` / `source.kind` / `provider` / `form`）。
+通道统一负责：只对真实用户输入触发（`onStep` + `stepEnabled` 的源才参与工具续跑 step）、每 `(session, turn/step, source, input)` 注入一次、**源并发执行**、每源独立超时（并 abort 请求）与失败隔离、`maxChars` / `totalMaxChars` 截断、`textHash` + surface 判定的跨轮/跨重启去重、消息构造（`id` / `source.kind` / `provider` / `form`）。
 
 无论加多少源，硬性不变的是这三条：
 
 1. 在 `agent/pre-step` 里，**先 `await next()` 再追加**，并用 `{ prepend: true }` 注册成最外层 —— 其它插件完全感知不到你的消息；
-2. 消息必须自备 `id`，并用私有的 `source.kind`；
+2. 消息必须用本体 `createUserMessage()` 构造（自带 `id`、深冻结），并用私有的 `source.kind`；
 3. 一切失败都只影响该源，`return decision` 原样放行。
 
 ## License

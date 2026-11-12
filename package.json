@@ -1,7 +1,7 @@
 {
   "name": "dsh-inject-context",
   "version": "0.1.0",
-  "description": "DeepSeek Harness context-injection plugin: retrieves OpenViking memories for the user's input and appends them as one standalone user message at agent/pre-step, with a settings page on the Plugins page.",
+  "description": "DeepSeek Harness context-injection plugin: retrieves OpenViking memories (plus a per-session memory index, and optional step recall driven by tool results) and appends each source as one standalone user message at agent/pre-step, with a settings page on the Plugins page.",
   "author": "abc12524",
   "repository": {
     "type": "git",
@@ -54,9 +54,11 @@
   ],
   "license": "MIT",
   "peerDependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.0.1-rc.1",
     "@deepseek-ai/schemastery": "^3.18.2"
   },
   "devDependencies": {
+    "@deepseek-ai/dsh-llm": "^0.0.1-rc.1",
     "@deepseek-ai/schemastery": "^3.18.2"
   }
 }

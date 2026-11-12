@@ -8,6 +8,9 @@ importers:
 
   .:
     devDependencies:
+      '@deepseek-ai/dsh-llm':
+        specifier: ^0.0.1-rc.1
+        version: 0.0.1-rc.1
       '@deepseek-ai/schemastery':
         specifier: ^3.18.2
         version: 3.18.4
@@ -16,6 +19,15 @@ packages:
 
   '@deepseek-ai/cosmokit@1.8.5':
     resolution: {integrity: sha512-LXsrlem9z8dq4sLflj2yuCuYX7KqhdzF5hZly3eZyuTo8d6oDSOXuEgC5DbQWKW+lksm6zmOutQLsP/ma6wR6A==}
+
+  '@deepseek-ai/dsh-llm@0.0.1-rc.1':
+    resolution: {integrity: sha512-mRJj07IQNfRReGrhpMpL8AONiYKqfwzxvepg/ut9Wkj8oH2BuoftPS4cMnnXFFCUlYql04/sezwDLriYks/bmw==}
+    peerDependencies:
+      '@deepseek-ai/cordis': ^4.0.1-rc.1
+      '@deepseek-ai/dsh-attachment': ^0.0.1-rc.1
+      '@deepseek-ai/dsh-brand': ^0.0.1-rc.1
+      '@deepseek-ai/dsh-invariants': ^0.0.1-rc.1
+      '@deepseek-ai/dsh-timeout': ^0.0.1-rc.1
 
   '@deepseek-ai/schemastery@3.18.4':
     resolution: {integrity: sha512-SSXO6tYuyrIqKVbmOnIq0s+riUywYzouFMcnBluHF9n4KMo2G8HvEzhCYj6pj2617/glOjbJuVInJ9hfONsjkg==}
@@ -26,6 +38,10 @@ packages:
 snapshots:
 
   '@deepseek-ai/cosmokit@1.8.5': {}
+
+  '@deepseek-ai/dsh-llm@0.0.1-rc.1':
+    dependencies:
+      '@deepseek-ai/schemastery': 3.18.4
 
   '@deepseek-ai/schemastery@3.18.4':
     dependencies:

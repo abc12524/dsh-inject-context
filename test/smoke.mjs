@@ -24,13 +24,13 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { Config, SOURCES, apply, inject, name } from '../lib/index.js'
+import { WARNING_EVENT, Config, SOURCES, apply, defineSource, inject, name, registerSource } from '../lib/index.js'
 
 // ---------------------------------------------------------------------------
 // Mock Cordis context
 // ---------------------------------------------------------------------------
 
-function makeCtx({ credentials } = {}) {
+function makeCtx({ credentials, services } = {}) {
   const listeners = []
   const logs = []
   return {
@@ -49,7 +49,7 @@ function makeCtx({ credentials } = {}) {
     },
     get(service) {
       if (service === 'credentials') return credentials
-      return undefined
+      return services?.[service]
     },
   }
 }
@@ -149,8 +149,8 @@ const BASE_CONFIG = {
   'ovApiKeyEnv': 'TEST_KEY',
 }
 
-function mount(overrides = {}) {
-  const ctx = makeCtx({ credentials })
+function mount(overrides = {}, options = {}) {
+  const ctx = makeCtx({ credentials, services: options.services })
   const config = Config({ ...BASE_CONFIG, ...overrides })
   const dispose = apply(ctx, config)
   const hook = ctx.listeners.find((l) => l.event === 'agent/pre-step')
@@ -176,6 +176,7 @@ assert.equal(Config.type, 'object')
 const VOLATILE_FIELDS = ['enabled', 'ovHost', 'ovScoreThreshold', 'ovLimit']
 const ORDINARY_FIELDS = [
   'maxChars',
+  'totalMaxChars',
   'timeoutMs',
   'dedupeUnchanged',
   'ovUser',
@@ -183,6 +184,16 @@ const ORDINARY_FIELDS = [
   'ovPeer',
   'ovApiKeyEnv',
   'ovAbstractChars',
+  'ovProfile',
+  'ovProfileLimit',
+  'ovProfileChars',
+  'ovStepRecall',
+  'ovStepQueryChars',
+  'skillList',
+  'skillService',
+  'skillListLimit',
+  'skillListChars',
+  'userTips',
 ]
 
 for (const field of VOLATILE_FIELDS) {
@@ -237,6 +248,8 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
 
   const injected = first.messages[2]
   assertPersistableUserMessage(injected, 'injected')
+  assert.equal(Object.isFrozen(injected), true, 'the shared constructor freezes the message')
+  assert.equal(Object.isFrozen(injected.content), true, 'including its content array')
   // The client classifies durable user messages by source.kind: 'user' renders
   // as a user bubble, anything else as an injected-context row labelled with
   // the kind. 'recall' selects its structured presentation.
@@ -525,10 +538,10 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
 
 {
   const { ctx, dispose } = mount()
-  assert.equal(ctx.listeners.length, 2, 'agent/pre-step plus agent/disposed')
+  assert.equal(ctx.listeners.length, 3, 'agent/pre-step plus agent/disposed plus the warning intake')
   dispose()
   assert.equal(ctx.listeners.length, 0)
-  console.log('case 12 ok  the returned disposer unregisters both listeners')
+  console.log('case 12 ok  the returned disposer unregisters every listener')
 }
 
 // ---------------------------------------------------------------------------
@@ -710,6 +723,356 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   } finally {
     SOURCES.pop()
   }
+}
+
+// ---------------------------------------------------------------------------
+// Case 15 — sources run concurrently, while output keeps registry order.
+// ---------------------------------------------------------------------------
+
+{
+  let slowStarted = false
+  let fastStarted = false
+  const slow = {
+    id: 'slow',
+    provider: 'slow',
+    form: 'notice',
+    enabled: () => true,
+    collect: async () => {
+      slowStarted = true
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      // With a serial channel this flag is still false: the second source only
+      // starts after the first finishes.
+      if (!fastStarted) throw new Error('sources ran serially')
+      return 'slow done'
+    },
+  }
+  const fast = {
+    id: 'fast',
+    provider: 'fast',
+    form: 'notice',
+    enabled: () => true,
+    collect: async () => {
+      fastStarted = true
+      return 'fast done'
+    },
+  }
+  SOURCES.push(slow, fast)
+  try {
+    fetchCalls = []
+    fetchImpl = async () => jsonResponse({ result: { memories: [] } })
+    const { hook } = mount()
+    const out = await runHook(hook, { agent: { id: 's15' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+    assert.equal(out.messages.length, 3, 'both sources inject')
+    assert.equal(out.messages[1].content[0].text, 'slow done', 'messages keep registry order')
+    assert.equal(out.messages[2].content[0].text, 'fast done')
+    console.log('case 15 ok  sources run concurrently and messages keep registry order')
+  } finally {
+    SOURCES.pop()
+    SOURCES.pop()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Case 16 — a timed-out source is aborted, not merely stopped waiting.
+// ---------------------------------------------------------------------------
+
+{
+  fetchCalls = []
+  let requestSignal
+  fetchImpl = async (_url, init) => {
+    requestSignal = init.signal
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(new Error('aborted by deadline')))
+    })
+  }
+  const { hook, ctx } = mount({ timeoutMs: 40 })
+  const out = await runHook(hook, { agent: { id: 's16' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  assert.equal(out.messages.length, 1, 'a timed-out source injects nothing')
+  assert.ok(requestSignal, 'the request carries an abort signal')
+  assert.equal(requestSignal.aborted, true, 'the per-source deadline aborts the request itself')
+  assert.ok(ctx.logs.some(([level]) => level === 'warn'), 'and the degradation is logged')
+  console.log('case 16 ok  a timed-out source is aborted and the step continues')
+}
+
+// ---------------------------------------------------------------------------
+// Case 17 — totalMaxChars caps a whole step, earliest source first.
+// ---------------------------------------------------------------------------
+
+{
+  const first = 'A'.repeat(100)
+  const second = 'B'.repeat(100)
+  SOURCES.push(
+    { id: 'a', provider: 'a', form: 'notice', enabled: () => true, collect: async () => first },
+    { id: 'b', provider: 'b', form: 'notice', enabled: () => true, collect: async () => second },
+  )
+  try {
+    fetchCalls = []
+    fetchImpl = async () => jsonResponse({ result: { memories: [] } })
+    const { hook } = mount({ totalMaxChars: 150 })
+    const out = await runHook(hook, { agent: { id: 's17' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+    const a = out.messages[1].content[0].text
+    const b = out.messages[2].content[0].text
+    assert.equal(a, first, 'the first source spends its full share')
+    assert.ok(b.startsWith('B'.repeat(50)), 'the second source receives the remaining 50 characters')
+    assert.ok(!b.startsWith('B'.repeat(51)), 'and not one character more')
+    assert.match(b, /truncated by dsh-inject-context/)
+    console.log('case 17 ok  totalMaxChars caps the step and serves sources in order')
+  } finally {
+    SOURCES.pop()
+    SOURCES.pop()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Case 18 — dedupe survives a restart: it is derived from the session log.
+// ---------------------------------------------------------------------------
+
+{
+  fetchCalls = []
+  fetchImpl = async () => jsonResponse(MEMORY_BODY)
+  const first = mount()
+  const injectedRun = await runHook(first.hook, { agent: { id: 's18' }, turn: 1, step: 1, signal }, [realUser('u1', '同样的提问')])
+  const injected = injectedRun.messages[1]
+
+  // A fresh mount has an empty ledger, exactly like a post-restart process.
+  const restarted = mount()
+  const session = {
+    header: { cwd: root },
+    snapshotEvents: () => [{ type: 'user/message', seq: 3, data: injected }],
+    surface: { nodes: [3] },
+  }
+  const out = await runHook(restarted.hook, { agent: { id: 's18', session }, turn: 1, step: 1, signal }, [realUser('u1', '同样的提问')])
+  assert.equal(out.messages.length, 1, 'a restarted process must derive dedupe from the log, not from memory')
+  console.log('case 18 ok  dedupe survives a restart by reading the durable log')
+}
+
+// ---------------------------------------------------------------------------
+// Case 19 — the memory index rides the first recall and is not rebuilt.
+// ---------------------------------------------------------------------------
+
+{
+  fetchCalls = []
+  fetchImpl = async (url) => {
+    if (String(url).includes('/api/v1/fs/tree')) {
+      return jsonResponse({ result: { entries: [{ name: '主题A' }, { title: '主题B' }] } })
+    }
+    return jsonResponse(MEMORY_BODY)
+  }
+  const { hook } = mount({ ovProfile: true, ovUser: 'alice' })
+  const first = await runHook(hook, { agent: { id: 's19' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  assert.equal(first.messages.length, 3, 'the index and the recall are one message each')
+  const indexText = first.messages[1].content[0].text
+  const recallText = first.messages[2].content[0].text
+  assert.equal(first.messages[1].source.form, 'catalog', 'the index is a catalog, not a recall')
+  assert.match(indexText, /记忆索引/)
+  assert.match(indexText, /主题A/)
+  assert.match(indexText, /主题B/)
+  assert.match(recallText, /相关记忆/)
+  assert.ok(!recallText.includes('记忆索引'), 'the index is not merged into the recall')
+  assert.equal(fetchCalls.filter((call) => String(call.url).includes('/api/v1/fs/tree')).length, 1, 'the tree is fetched once')
+
+  // The session log already carries the index and the surface still shows both
+  // messages, so the index is not rebuilt and the identical recall is skipped.
+  const session = {
+    header: { cwd: root },
+    snapshotEvents: () => [
+      { type: 'user/message', seq: 5, data: first.messages[1] },
+      { type: 'user/message', seq: 6, data: first.messages[2] },
+    ],
+    surface: { nodes: [5, 6] },
+  }
+  const second = await runHook(hook, { agent: { id: 's19', session }, turn: 2, step: 1, signal }, [realUser('u2', 'hi')])
+  assert.equal(second.messages.length, 1, 'neither the index nor the identical recall is re-sent')
+  assert.equal(
+    fetchCalls.filter((call) => String(call.url).includes('/api/v1/fs/tree')).length,
+    1,
+    'an index already in the log is never rebuilt',
+  )
+  console.log('case 19 ok  the memory index is a separate catalog message and is derived from the log')
+}
+
+// ---------------------------------------------------------------------------
+// Case 20 — step recall queries on the tool result and is off by default.
+// ---------------------------------------------------------------------------
+
+{
+  const toolTurn = {
+    id: 's20',
+    session: {
+      header: { cwd: root },
+      snapshotEvents: () => [
+        { type: 'turn/start', seq: 0, data: { turn: 1 } },
+        { type: 'user/message', seq: 1, data: realUser('u1', '查一下构建配置') },
+        {
+          type: 'tool/result',
+          seq: 2,
+          data: { turn: 1, step: 1, message: { id: 't1', role: 'tool', content: [{ type: 'text', text: 'BUILD_TARGET=android' }] } },
+        },
+      ],
+      surface: { nodes: [1, 2] },
+    },
+  }
+
+  fetchCalls = []
+  fetchImpl = async () => jsonResponse(MEMORY_BODY)
+  const { hook } = mount({ ovStepRecall: true })
+  const stepTwo = await runHook(
+    hook,
+    { agent: toolTurn, turn: 1, step: 2, signal },
+    [runtimeContext('rc1', 'Current runtime context.')],
+  )
+  assert.equal(fetchCalls.length, 1, 'a tool-continuation step retrieves when step recall is on')
+  const query = JSON.parse(fetchCalls[0].init.body).query
+  assert.match(query, /查一下构建配置/, 'the query carries the turn user text')
+  assert.match(query, /BUILD_TARGET=android/, 'and the tool result')
+  assert.equal(stepTwo.messages.length, 2, 'the step receives its own recall block')
+
+  // The same step is served once, so a repeated pre-step costs no request.
+  const repeated = await runHook(
+    hook,
+    { agent: toolTurn, turn: 1, step: 2, signal },
+    [runtimeContext('rc1', 'Current runtime context.')],
+  )
+  assert.equal(fetchCalls.length, 1, 'the same step is not retrieved twice')
+  assert.equal(repeated.messages.length, 1)
+
+  // Off by default: a plain mount must not retrieve on a continuation step.
+  fetchCalls = []
+  const plain = mount()
+  const skipped = await runHook(
+    plain.hook,
+    { agent: toolTurn, turn: 1, step: 2, signal },
+    [runtimeContext('rc1', 'Current runtime context.')],
+  )
+  assert.equal(fetchCalls.length, 0, 'step recall is opt-in')
+  assert.equal(skipped.messages.length, 1)
+  console.log('case 20 ok  step recall queries on the tool result and is off by default')
+}
+
+// ---------------------------------------------------------------------------
+// Case 21 — user tips are injected once per session, config or env.
+// ---------------------------------------------------------------------------
+
+{
+  fetchCalls = []
+  fetchImpl = async () => jsonResponse({ result: { memories: [] } })
+  const { hook } = mount({ userTips: '回答用中文，并给出命令示例' })
+  const first = await runHook(hook, { agent: { id: 's21' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  const text = first.messages[1].content[0].text
+  assert.match(text, /<user_tips>/, 'the block carries its marker')
+  assert.match(text, /回答用中文/)
+  assert.equal(first.messages[1].source.form, 'instructions')
+
+  const session = {
+    header: { cwd: root },
+    snapshotEvents: () => [{ type: 'user/message', seq: 2, data: first.messages[1] }],
+    surface: { nodes: [2] },
+  }
+  const second = await runHook(hook, { agent: { id: 's21', session }, turn: 2, step: 1, signal }, [realUser('u2', 'hi again')])
+  assert.equal(second.messages.length, 1, 'tips are delivered once per session')
+
+  // The environment variable is the fallback an API gateway uses.
+  process.env.USER_TIPS = '这条来自 QQ 通道'
+  try {
+    const envMount = mount()
+    const fromEnv = await runHook(envMount.hook, { agent: { id: 's21b' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+    assert.match(fromEnv.messages[1].content[0].text, /这条来自 QQ 通道/)
+  } finally {
+    delete process.env.USER_TIPS
+  }
+  console.log('case 21 ok  user tips are once-per-session and fall back to USER_TIPS')
+}
+
+// ---------------------------------------------------------------------------
+// Case 22 — the skill catalog is supplied by another plugin's service.
+// ---------------------------------------------------------------------------
+
+{
+  fetchCalls = []
+  fetchImpl = async () => jsonResponse({ result: { memories: [] } })
+  const skills = {
+    list: async () => [
+      { name: 'file-tools', description: '读写文件' },
+      { name: 'shell', description: '执行命令' },
+    ],
+  }
+  const { hook } = mount({ skillList: true }, { services: { shellSkills: skills } })
+  const first = await runHook(hook, { agent: { id: 's22' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  const catalog = first.messages[1]
+  assert.equal(catalog.source.form, 'catalog')
+  const text = catalog.content[0].text
+  assert.match(text, /<available_skills>/)
+  assert.match(text, /- `file-tools`: 读写文件/)
+  assert.match(text, /- `shell`: 执行命令/)
+
+  // No provider registered → nothing is injected, even when enabled.
+  const noProvider = mount({ skillList: true })
+  const missing = await runHook(noProvider.hook, { agent: { id: 's22b' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  assert.equal(missing.messages.length, 1)
+
+  // Off by default, so a provider alone changes nothing.
+  const off = mount({}, { services: { shellSkills: skills } })
+  const disabled = await runHook(off.hook, { agent: { id: 's22c' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  assert.equal(disabled.messages.length, 1)
+  console.log('case 22 ok  the skill catalog is read from the provider service and is opt-in')
+}
+
+// ---------------------------------------------------------------------------
+// Case 23 — runtime warnings ride the event into the next step, once.
+// ---------------------------------------------------------------------------
+
+{
+  fetchCalls = []
+  fetchImpl = async () => jsonResponse({ result: { memories: [] } })
+  const { hook, ctx } = mount()
+  const intake = ctx.listeners.find((listener) => listener.event === WARNING_EVENT)
+  assert.ok(intake, 'the plugin listens for runtime warnings')
+  intake.handler({ agent: { id: 's23' }, text: '工具调用已达上限，不要再调用工具' })
+
+  const out = await runHook(hook, { agent: { id: 's23' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  const warning = out.messages[1]
+  assert.equal(warning.source.form, 'notice', 'a warning is a one-off notice')
+  assert.equal(typeof warning.source.summary, 'string', 'a notice must carry its one-line account')
+  assert.match(warning.content[0].text, /<user_warning>/)
+  assert.match(warning.content[0].text, /不要再调用工具/)
+
+  const drained = await runHook(hook, { agent: { id: 's23' }, turn: 2, step: 1, signal }, [realUser('u2', 'hi again')])
+  assert.equal(drained.messages.length, 1, 'a warning is consumed by the step that received it')
+
+  console.log('case 23 ok  runtime warnings are event-fed, notice-form, and consumed once')
+}
+
+// ---------------------------------------------------------------------------
+// Case 24 — the public source interface validates and can be unregistered.
+// ---------------------------------------------------------------------------
+
+{
+  assert.throws(() => defineSource({ id: 'x' }), /provider/, 'a source must declare its provider')
+  assert.throws(() => defineSource({ id: 'x', provider: 'x', form: 'notice' }), /enabled/, 'and its gate')
+  assert.throws(() => defineSource({ id: 'x', provider: 'x', form: 'notice', enabled: () => true }), /collect/, 'and its collector')
+
+  fetchCalls = []
+  fetchImpl = async () => jsonResponse({ result: { memories: [] } })
+  const custom = defineSource({
+    id: 'custom',
+    provider: 'custom',
+    form: 'notice',
+    enabled: () => true,
+    collect: async () => 'custom source text',
+    summary: () => 'custom',
+  })
+  const unregister = registerSource(custom)
+  try {
+    const { hook } = mount()
+    const out = await runHook(hook, { agent: { id: 's24' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+    assert.equal(out.messages.length, 2)
+    assert.equal(out.messages[1].content[0].text, 'custom source text')
+    assert.equal(out.messages[1].source.summary, 'custom')
+  } finally {
+    unregister()
+  }
+  assert.equal(SOURCES.includes(custom), false, 'the disposer removes the source')
+  console.log('case 24 ok  defineSource validates and registerSource returns a disposer')
 }
 
 // ---------------------------------------------------------------------------
