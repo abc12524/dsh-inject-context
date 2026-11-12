@@ -1193,6 +1193,108 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
 }
 
 // ---------------------------------------------------------------------------
+// Case 23 — a skill that appears mid-conversation is announced, exactly once.
+// ---------------------------------------------------------------------------
+
+{
+  // A registry that grows the way `dsh-shell-skills` does: a directory scan per
+  // `list()` call, so a skill written mid-conversation shows up on the next read.
+  const installed = [
+    { name: 'file-tools', description: '读写文件' },
+    { name: 'shell', description: '执行命令' },
+  ]
+  const registry = {
+    calls: 0,
+    async list() {
+      registry.calls += 1
+      return installed.map((entry) => ({ ...entry }))
+    },
+  }
+  const { hook } = mount({ ovEnabled: false, userTips: '' }, { services: { shellSkills: registry } })
+
+  const turn1 = await runHook(hook, { agent: { id: 's23' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  const firstText = turn1.messages[1].content[0].text
+  assert.match(firstText, /- `file-tools`: 读写文件/)
+  assert.match(firstText, /- `shell`: 执行命令/)
+  assert.doesNotMatch(firstText, /published more skills/, 'the first delivery is the full catalog, not an addition')
+  assert.equal(registry.calls, 1, 'one read per delivery')
+
+  /** The session as the harness would report it after the injected messages. */
+  const sessionOf = (...messages) => ({
+    header: { cwd: root },
+    snapshotEvents: () => messages.map((message, index) => ({ type: 'user/message', seq: index + 1, data: message })),
+    surface: { nodes: messages.map((_message, index) => index + 1) },
+  })
+
+  // The user asks for a skill; `dsh-shell-skills` writes it to the skill root.
+  installed.push({ name: 'new-skill', description: '刚创建的新技能' })
+
+  const turn2 = await runHook(
+    hook,
+    { agent: { id: 's23', session: sessionOf(turn1.messages[1]) }, turn: 2, step: 1, signal },
+    [realUser('u2', '用刚建的技能')],
+  )
+  assert.equal(turn2.messages.length, 2, 'the addition is injected on the very next turn')
+  const delta = turn2.messages[1].content[0].text
+  assertFenced(delta, 'delta')
+  assert.match(delta, /<shell_skills>/, 'an addition still travels inside the catalog envelope')
+  assert.match(delta, /published more skills/, 'and says that the earlier entries still stand')
+  assert.match(delta, /- `new-skill`: 刚创建的新技能/)
+  assert.doesNotMatch(delta, /- `file-tools`/, 'already-announced skills are not repeated')
+  assert.doesNotMatch(delta, /- `shell`/, 'and neither are the others')
+
+  // Announced once: the log now carries both blocks, so a third turn is silent.
+  const turn3 = await runHook(
+    hook,
+    { agent: { id: 's23', session: sessionOf(turn1.messages[1], turn2.messages[1]) }, turn: 3, step: 1, signal },
+    [realUser('u3', '继续')],
+  )
+  assert.equal(turn3.messages.length, 1, 'a registry that has not grown injects nothing')
+
+  // A skill added mid-turn reaches the next step of the same turn. A step's
+  // decision carries no user message, so this is the tool-continuation path.
+  installed.push({ name: 'mid-turn', description: '同轮内新增' })
+  const stepSession = {
+    header: { cwd: root },
+    snapshotEvents: () => [
+      { type: 'turn/start', seq: 0, data: { turn: 3 } },
+      { type: 'user/message', seq: 1, data: turn1.messages[1] },
+      { type: 'user/message', seq: 2, data: realUser('u3', '继续') },
+      {
+        type: 'tool/result',
+        seq: 3,
+        data: { turn: 3, step: 1, message: { id: 't1', role: 'tool', content: [{ type: 'text', text: 'skill written' }] } },
+      },
+    ],
+    surface: { nodes: [1, 2, 3] },
+  }
+  const step2 = await runHook(
+    hook,
+    { agent: { id: 's23', session: stepSession }, turn: 3, step: 2, signal },
+    [runtimeContext('rc1', 'Current runtime context.')],
+  )
+  assert.equal(step2.messages.length, 2, 'a tool-continuation step announces what appeared since it started')
+  assert.match(step2.messages[1].content[0].text, /- `mid-turn`: 同轮内新增/)
+
+  // A removed skill is not announced: the catalog only ever grows, so the text
+  // already sent stays true.
+  installed.length = 0
+  const turn4 = await runHook(
+    hook,
+    {
+      agent: { id: 's23', session: sessionOf(turn1.messages[1], turn2.messages[1], step2.messages[1]) },
+      turn: 4,
+      step: 1,
+      signal,
+    },
+    [realUser('u4', '继续')],
+  )
+  assert.equal(turn4.messages.length, 1, 'an empty registry adds nothing to say')
+
+  console.log('case 23 ok  a skill added mid-conversation is announced once, as an addition')
+}
+
+// ---------------------------------------------------------------------------
 // Cleanup
 // ---------------------------------------------------------------------------
 

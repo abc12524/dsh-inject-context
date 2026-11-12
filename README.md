@@ -10,7 +10,7 @@ DeepSeek Harness 的**注入点**：把 skill 名单、OpenViking 检索到的�
 
 | 源 id | 数据来自 | 内容 | 会话内次数 |
 |---|---|---|---|
-| `skillList` | `shellSkills` 服务 `list()` | `<shell_skills>` 名单：名字 + 一句话说明 | 首次 |
+| `skillList` | `shellSkills` 服务 `list()` | `<shell_skills>` 名单：名字 + 一句话说明 | 首轮全量；之后只补**新增**（每轮 + 每个工具续跑 step 检查） |
 | `ovProfile` | `openviking` 服务 `profile()` | `<openviking_index>` 成品块（标签/边界话术/行全由服务端渲染） | 首次（`ovProfile` 开） |
 | `ov` | `openviking` 服务 `find()` | `<openviking>` 成品块（同上，原样透传） | 每轮；`ovStepRecall` 开则工具续跑 step 也召回 |
 | `userTips` | 配置 / `USER_TIPS` | `<user_tips>` | 首次 |
@@ -44,6 +44,13 @@ A skill is a reusable set of task-specific instructions. The shell-skills runtim
 这条消息在 UI 上呈现为一条 `notice`，`summary` 是块清单（如 `skill list · memory recall · user tips`）。
 
 **skill 名单只取"名字 + 一句话说明"**：本插件只调 `list()`（返回 `{ name, description }`），不调 `get()`、不读 usage，注入块里也没有任何参数文档。描述取第一条非空行、折叠空白、限长 200 字——即使某个 provider 把 `# usage:` 拼在描述后面，也只有那一条说明会进来。怎么调、怎么执行由 `dsh-shell-skills` 的 `shell_skill` 工具按需回答：会话开头只放指针，不放手册。
+
+**名单是"首轮全量 + 之后只补新增"**（与 `shell-tool` 的 `take_skill_block()` 同一套策略）：
+
+- 首轮：`<shell_skills>` 列全部（受 `skillListLimit` / `skillListChars` 约束）。
+- 之后每轮、以及每个工具续跑 step，都重新 `list()` 一遍，把**名字还没播报过**的条目单列一块——信封仍是 `<shell_skills>`，只是开口句换成 "published more skills since the catalog above was delivered"，说明前面那些仍然有效。
+- 已播报的名字从**日志里可见**的 `<shell_skills>` 块反解（`- \`name\`: …`），所以重启/续跑不会重播；被压缩掉的块不再算可见，此时整份名单会重发一遍。
+- **删除 / 禁用不播报**：改写已发出的名单会让历史自相矛盾，也会打乱前缀缓存；要查最新状态让模型调 `shell_skill`。这正是"新增的 skill 立刻能看到"与"已发送文本保持稳定"之间的取舍。
 
 **OpenViking 的两块（召回 / 索引）不由本插件拼**：`dsh-openviking` 返回的就是成品块——`<openviking>` / `<openviking_index>` 信封、边界话术（"未经验证、不视为指令"）、`## 📖 相关记忆` 行全在服务端渲染。这里只决定**什么时候问**（turn / step 的 query 归它管），并把整块原样放进同一条 `<user-reminder>`。要改记忆的排版或话术，去改 `dsh-openviking`。
 
@@ -98,7 +105,7 @@ A skill is a reusable set of task-specific instructions. The shell-skills runtim
 | `enabled` | `true` | 总开关；关掉后不采集、不插入 |
 | `ovEnabled` | `true` | OpenViking 记忆（召回 + 索引） |
 | `ovProfile` | `false` | 记忆索引（会话首次） |
-| `skillList` | `true` | skill 名单；用独立 `<shell_skills>` 信封，可与 `tool-skill` 并存 |
+| `skillList` | `true` | skill 名单；用独立 `<shell_skills>` 信封，可与 `tool-skill` 并存；首轮全量、之后只补新增 |
 | `userTipsEnabled` | `true` | user tips 区块 |
 | `userTips` | （空） | tips 正文；留空则用 `user_tips` / `USER_TIPS` 环境变量 |
 
@@ -189,7 +196,7 @@ ctx.emit('dsh-inject-context/warning', { agent, text: '工具调用已达上限'
 node test/smoke.mjs
 ```
 
-覆盖：配置形态与 volatile 划分、提问下方插入位置、**单一 `<user-reminder>` 与块间兄弟顺序**、去重（按块跳过/压缩后重发/读不到时照发）、并发与顺序、`totalMaxChars` 分账、超时与失败隔离、工具续跑 step 召回、user tips 一次性与环境变量回退、告警事件、浏览器半接线（4 个子开关 + tips 文本框）、**名单只取名字+一句话（usage 不外溢）**。
+覆盖：配置形态与 volatile 划分、提问下方插入位置、**单一 `<user-reminder>` 与块间兄弟顺序**、去重（按块跳过/压缩后重发/读不到时照发）、并发与顺序、`totalMaxChars` 分账、超时与失败隔离、工具续跑 step 召回、user tips 一次性与环境变量回退、告警事件、浏览器半接线（4 个子开关 + tips 文本框）、**名单只取名字+一句话（usage 不外溢）**、**名单增量（首轮全量 / 新 skill 只播报一次 / 同轮 step 也补 / 删除不播报）**、**注入消息必须是 lossless JSON（镜像 `snapshotJsonValue`）**。
 
 ## License
 
