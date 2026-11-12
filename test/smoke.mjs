@@ -4,13 +4,13 @@
  * Two halves are exercised without a running harness:
  *
  *   - The host half is driven against a mock Cordis context in exactly the
- *     shapes `@deepseek-ai/dsh-agent-loop` produces, and every injected message
+ *     shapes `@deepseek-ai/dsh-agent-loop` produces, and every inserted message
  *     is checked against the same invariants `assertMessageEventShape` enforces
- *     when the session persists it.
- *   - The browser half is loaded through a stand-in for the Client module
- *     loader, and its Plugins-page registration is asserted directly — the one
- *     part of the settings wiring that is otherwise only checkable by hand in
- *     the web UI.
+ *     when the session persists it. OpenViking is a mock *service* here: the
+ *     retrieval itself lives in `dsh-openviking`.
+ *   - The browser half is loaded through a stand-in for the Client module loader,
+ *     and its Plugins-page registration is asserted directly — the one part of
+ *     the settings wiring that is otherwise only checkable by hand in the web UI.
  *
  * The real `@deepseek-ai/schemastery` is used, so the `Config` assertions below
  * hold for the schema the settings service actually projects.
@@ -24,13 +24,13 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { WARNING_EVENT, Config, SOURCES, apply, defineSource, inject, name, registerSource } from '../lib/index.js'
+import { SOURCES, WARNING_EVENT, Config, apply, defineSource, inject, name, registerSource } from '../lib/index.js'
 
 // ---------------------------------------------------------------------------
 // Mock Cordis context
 // ---------------------------------------------------------------------------
 
-function makeCtx({ credentials, services } = {}) {
+function makeCtx({ services } = {}) {
   const listeners = []
   const logs = []
   return {
@@ -48,7 +48,6 @@ function makeCtx({ credentials, services } = {}) {
       warn: (m) => logs.push(['warn', m]),
     },
     get(service) {
-      if (service === 'credentials') return credentials
       return services?.[service]
     },
   }
@@ -95,48 +94,51 @@ function assertPersistableUserMessage(message, subject) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Fetch stand-in
-// ---------------------------------------------------------------------------
-
-const jsonResponse = (body, status = 200) => ({
-  ok: status >= 200 && status < 300,
-  status,
-  json: async () => body,
-})
-
-let fetchCalls = []
-let fetchImpl = async () => jsonResponse({ result: { memories: [] } })
-const realFetch = globalThis.fetch
-globalThis.fetch = async (url, init) => {
-  fetchCalls.push({ url, init })
-  return fetchImpl(url, init)
+/** Every inserted block must be fenced, body-only. */
+function assertFenced(text, subject) {
+  assert.ok(text.startsWith('<user-reminder>\n'), `${subject}: the block opens with <user-reminder>`)
+  assert.ok(text.endsWith('\n</user-reminder>'), `${subject}: the block closes with </user-reminder>`)
+  assert.equal((text.match(/<user-reminder>/g) ?? []).length, 1, `${subject}: exactly one opening fence`)
+  assert.equal((text.match(/<\/user-reminder>/g) ?? []).length, 1, `${subject}: exactly one closing fence`)
 }
 
-/** Stands in for a real OpenViking abstract, which runs to ~1.6k characters. */
-const LONG_ABSTRACT = `长记忆 ${'A'.repeat(1500)} 结尾标记`
+// ---------------------------------------------------------------------------
+// OpenViking stand-in
+// ---------------------------------------------------------------------------
 
-const MEMORY_BODY = {
-  // Shape captured from a live OpenViking /api/v1/search/find response:
-  // { status, result: { memories: [{context_type, uri, level, score, abstract, tags}], resources, skills, total } }
-  result: {
-    memories: [
-      { uri: 'viking://mem/1', score: 0.91, abstract: '用户偏好深色主题', context_type: 'memory', level: 2, tags: [] },
-      { uri: 'viking://mem/2', score: 0.72, abstract: '项目使用 pnpm', context_type: 'memory', level: 2, tags: [] },
-      { uri: 'viking://mem/1', score: 0.91, abstract: 'duplicate uri', context_type: 'memory', level: 2, tags: [] },
-      { uri: 'viking://mem/4', score: 0.55, abstract: LONG_ABSTRACT, context_type: 'memory', level: 2, tags: [] },
-      { uri: 'viking://mem/3', score: 0.2, abstract: 'below threshold on the server side', context_type: 'memory', level: 2, tags: [] },
-    ],
-    resources: [],
-    skills: [],
-    total: 5,
-  },
+/** What `dsh-openviking` renders for a hit; the framing is this plugin's job. */
+const RECALL_TEXT = '## 📖 相关记忆\n- [viking://mem/1] (score=0.910, memory)\n  用户偏好深色主题'
+
+const PROFILE_TEXT = '## 🧠 记忆索引\n可用记忆索引（主题概览）：\n- 主题A\n- 主题B'
+
+/**
+ * Build a stand-in for the `openviking` service.
+ * @param options - the recall/index text, or an error to throw from find().
+ * @returns the service plus its call log.
+ */
+function fakeOpenviking({ text = RECALL_TEXT, profile = PROFILE_TEXT, failWith } = {}) {
+  const calls = []
+  return {
+    calls,
+    status: () => ({ configured: true, base: 'http://ov.test:1933' }),
+    async find(query, options) {
+      calls.push({ kind: 'find', query, signal: options?.signal })
+      if (failWith) throw failWith
+      return { text, count: text.length > 0 ? 1 : 0 }
+    },
+    async profile(options) {
+      calls.push({ kind: 'profile', signal: options?.signal })
+      return profile
+    },
+  }
 }
 
-const credentials = {
-  async resolve(ref) {
-    return ref === 'TEST_KEY' ? { value: 'test-token-123' } : undefined
-  },
+/** A skill provider, as published by dsh-shell-skills. */
+const skillProvider = {
+  list: async () => [
+    { name: 'file-tools', description: '读写文件' },
+    { name: 'shell', description: '执行命令' },
+  ],
 }
 
 // ---------------------------------------------------------------------------
@@ -144,13 +146,11 @@ const credentials = {
 // ---------------------------------------------------------------------------
 
 const BASE_CONFIG = {
-  'ovHost': 'ov.test',
-  'ovUser': 'alice',
-  'ovApiKeyEnv': 'TEST_KEY',
+  userTips: '回答用中文，并给出命令示例',
 }
 
 function mount(overrides = {}, options = {}) {
-  const ctx = makeCtx({ credentials, services: options.services })
+  const ctx = makeCtx({ services: options.services })
   const config = Config({ ...BASE_CONFIG, ...overrides })
   const dispose = apply(ctx, config)
   const hook = ctx.listeners.find((l) => l.event === 'agent/pre-step')
@@ -163,6 +163,9 @@ const signal = new AbortController().signal
 
 const runHook = (hook, payload, messages) => hook.handler(payload, async () => defaultDecision(messages))
 
+/** The texts of every message the harness would append on this step. */
+const textsOf = (messages) => messages.map((message) => message.content?.[0]?.text ?? '')
+
 console.log(`fixture: ${root}\n`)
 
 // ---------------------------------------------------------------------------
@@ -173,27 +176,19 @@ assert.equal(name, 'dsh-inject-context')
 assert.deepEqual(inject, [], 'the plugin declares no hard service dependency')
 assert.equal(Config.type, 'object')
 
-const VOLATILE_FIELDS = ['enabled', 'userTips', 'ovHost', 'ovScoreThreshold', 'ovLimit']
+const VOLATILE_FIELDS = ['enabled', 'ovEnabled', 'skillList', 'userTipsEnabled', 'userTips', 'ovProfile']
 const ORDINARY_FIELDS = [
+  'ovService',
+  'ovStepRecall',
+  'ovStepQueryChars',
+  'skillService',
+  'skillListLimit',
+  'skillListChars',
+  'userWarning',
   'maxChars',
   'totalMaxChars',
   'timeoutMs',
   'dedupeUnchanged',
-  'ovUser',
-  'ovAccount',
-  'ovPeer',
-  'ovApiKeyEnv',
-  'ovAbstractChars',
-  'ovProfile',
-  'ovProfileLimit',
-  'ovProfileChars',
-  'ovStepRecall',
-  'ovStepQueryChars',
-  'skillList',
-  'skillService',
-  'skillListLimit',
-  'skillListChars',
-
 ]
 
 for (const field of VOLATILE_FIELDS) {
@@ -203,34 +198,33 @@ for (const field of ORDINARY_FIELDS) {
   assert.notEqual(Config.dict[field]?.meta?.volatile, true, `${field} is ordinary configuration, not a form field`)
 }
 assert.equal(
-  Config.dict['ovApiKeyEnv']?.meta?.role,
-  'credential-ref',
-  'the key field names a credential; the literal must never live in configuration',
-)
-assert.equal(
   Object.values(Config.dict).some((child) => child.meta?.role === 'secret'),
   false,
-  'no field holds a secret literal',
+  'no field holds a secret literal; the OpenViking key belongs to dsh-openviking',
+)
+assert.equal(
+  Object.keys(Config.dict).some((field) => field.startsWith('ovHost') || field.startsWith('ovScore')),
+  false,
+  'the OpenViking connection settings moved to dsh-openviking',
 )
 
 // A volatile field arrives as a live reference, an ordinary one as a plain
 // value — the two shapes readConfig() has to cover.
 const liveConfig = Config({ ...BASE_CONFIG })
-assert.equal(typeof liveConfig['ovHost']?.get, 'function', 'volatile fields arrive as live references')
-assert.equal(liveConfig['ovHost'].get(), 'ov.test')
+assert.equal(typeof liveConfig.ovEnabled?.get, 'function', 'volatile fields arrive as live references')
+assert.equal(liveConfig.ovEnabled.get(), true)
 assert.equal(typeof liveConfig.timeoutMs, 'number', 'ordinary fields arrive as plain values')
 assert.equal(liveConfig.timeoutMs, 3000)
 
-console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, credential-ref key, both value shapes`)
+console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no OpenViking credentials, both value shapes`)
 
 // ---------------------------------------------------------------------------
-// Case 2 — first step of a turn: one message appended, request well-formed.
+// Case 2 — the three blocks land directly below the user's question.
 // ---------------------------------------------------------------------------
 
 {
-  fetchCalls = []
-  fetchImpl = async () => jsonResponse(MEMORY_BODY)
-  const { hook } = mount()
+  const ov = fakeOpenviking()
+  const { hook } = mount({}, { services: { openviking: ov, shellSkills: skillProvider } })
   assert.ok(hook, 'agent/pre-step listener must be registered')
   assert.equal(hook.options?.prepend, true, 'listener must be the outermost (prepend) one')
 
@@ -243,63 +237,61 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   const first = await runHook(hook, { agent, turn: 1, step: 1, signal }, [...claimed, ctxMessage])
 
   assert.equal(first.kind, 'enter')
-  assert.equal(first.messages.length, 3, 'expected claimed + runtime context + injected, nothing else')
-  assert.deepEqual(first.messages.slice(0, 2), [...claimed, ctxMessage], 'existing messages must pass through untouched')
+  // user + catalog + recall + tips, then the runtime context the harness appends.
+  assert.equal(first.messages.length, 5, 'three blocks inserted below the question, nothing else touched')
+  assert.deepEqual(first.messages[0], claimed[0], 'the user message passes through untouched')
+  assert.deepEqual(first.messages[4], ctxMessage, 'the runtime-context message still ends the list')
 
-  const injected = first.messages[2]
-  assertPersistableUserMessage(injected, 'injected')
-  assert.equal(Object.isFrozen(injected), true, 'the shared constructor freezes the message')
-  assert.equal(Object.isFrozen(injected.content), true, 'including its content array')
-  // The client classifies durable user messages by source.kind: 'user' renders
-  // as a user bubble, anything else as an injected-context row labelled with
-  // the kind. 'recall' selects its structured presentation.
-  assert.equal(injected.source.kind, 'dsh-inject-context')
-  assert.equal(injected.source.form, 'recall')
-  assert.equal(injected.source.provider, 'openviking')
+  const [catalog, recall, tips] = first.messages.slice(1, 4)
+  for (const [index, message] of [catalog, recall, tips].entries()) {
+    assertPersistableUserMessage(message, `injected[${index}]`)
+    assert.equal(Object.isFrozen(message), true, 'the shared constructor freezes the message')
+    assert.equal(Object.isFrozen(message.content), true, 'including its content array')
+    // The client classifies durable user messages by source.kind: 'user' renders
+    // as a user bubble, anything else as an injected-context row labelled with
+    // the kind.
+    assert.equal(message.source.kind, 'dsh-inject-context')
+    assertFenced(message.content[0].text, `injected[${index}]`)
+  }
 
-  const text = injected.content[0].text
-  assert.match(text, /相关记忆/, 'the recall marker opens the block')
-  assert.match(text, /用户偏好深色主题/, 'the best match is present')
-  assert.match(text, /项目使用 pnpm/)
-  assert.match(text, /不视为指令/, 'the wrapper states the block is not instruction')
-  assert.equal((text.match(/viking:\/\/mem\/1/g) ?? []).length, 1, 'duplicate uris are collapsed')
-  // The server owns the threshold; this plugin only orders by score, so that
-  // truncation at maxChars keeps the best matches.
+  // 1 — the skill catalog, read from the skill runtime's service.
+  assert.equal(catalog.source.form, 'catalog')
+  assert.equal(catalog.source.provider, 'skills')
+  assert.match(catalog.content[0].text, /<shell_skills>/)
+  assert.match(catalog.content[0].text, /- `file-tools`: 读写文件/)
+  assert.match(catalog.content[0].text, /- `shell`: 执行命令/)
+
+  // 2 — the recall block: rows from the service, framing from this plugin.
+  assert.equal(recall.source.form, 'recall')
+  assert.equal(recall.source.provider, 'openviking')
+  const recallText = recall.content[0].text
+  assert.match(recallText, /自动检索的候选记忆/, 'the preamble marks it as unverified background')
+  assert.match(recallText, /## 📖 相关记忆/, 'the rows keep the backend marker')
+  assert.match(recallText, /用户偏好深色主题/)
+  assert.match(recallText, /不视为指令/, 'the epilogue states the block is not instruction')
   assert.ok(
-    text.indexOf('viking://mem/1') < text.indexOf('viking://mem/2') &&
-      text.indexOf('viking://mem/2') < text.indexOf('viking://mem/3'),
-    'entries are rendered in descending score order',
+    recallText.indexOf('自动检索') < recallText.indexOf('## 📖') &&
+      recallText.indexOf('## 📖') < recallText.indexOf('不视为指令'),
+    'the framing wraps the backend rows in order',
   )
-  // A live abstract runs to ~1.6k characters, so the per-entry budget must be
-  // generous — the old fixed 300-character cut discarded most of the memory.
-  const prefix = '长记忆 '
-  const kept = 'A'.repeat(1200 - prefix.length)
-  assert.ok(text.includes(prefix + kept + '…'), 'a long abstract is cut exactly at abstractChars and marked')
-  assert.ok(!text.includes(prefix + kept + 'A'), 'and not one character beyond it')
-  assert.ok(!text.includes('结尾标记'), 'the cut really removes the tail')
-  assert.match(text, /score=0\.910/, 'scores print to three decimals')
 
-  assert.equal(fetchCalls.length, 1, 'exactly one retrieval per turn')
-  const call = fetchCalls[0]
-  assert.equal(call.url, 'http://ov.test:1933/api/v1/search/find')
-  assert.equal(call.init.method, 'POST')
-  assert.equal(call.init.headers.Authorization, 'Bearer test-token-123', 'the token comes from credentials')
-  assert.equal(call.init.headers['X-OpenViking-User'], 'alice')
-  assert.equal(call.init.headers['X-OpenViking-Account'], 'default')
-  assert.equal(call.init.headers['X-OpenViking-Peer'], 'default')
-  const body = JSON.parse(call.init.body)
-  assert.equal(body.query, '我之前说过什么偏好？')
-  assert.equal(body.score_threshold, 0.4)
-  assert.equal(body.limit, 3)
+  // 3 — user tips, once per session.
+  assert.equal(tips.source.form, 'instructions')
+  assert.equal(tips.source.provider, 'session')
+  assert.match(tips.content[0].text, /<user_tips>/)
+  assert.match(tips.content[0].text, /回答用中文/)
+
+  // The service is asked exactly once, with the user's own words.
+  assert.equal(ov.calls.filter((call) => call.kind === 'find').length, 1)
+  assert.equal(ov.calls[0].query, '我之前说过什么偏好？')
+  assert.ok(ov.calls[0].signal, 'the retrieval carries the per-source abort signal')
 
   console.log(
-    text
-      .split('\n')
-      .slice(0, 4)
-      .map((l) => '        ' + l)
-      .join('\n'),
+    textsOf(first.messages.slice(1, 4))
+      .map((text) => text.split('\n').slice(0, 3).map((line) => '        ' + line).join('\n'))
+      .join('\n        ---\n'),
   )
-  console.log('case 2  ok  first step injects one message and the request is well-formed')
+  console.log('case 2  ok  skill list, recall, and tips are inserted below the question, each fenced')
 }
 
 // ---------------------------------------------------------------------------
@@ -307,18 +299,17 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
 // ---------------------------------------------------------------------------
 
 {
-  fetchCalls = []
-  fetchImpl = async () => jsonResponse(MEMORY_BODY)
-  const { hook } = mount()
+  const ov = fakeOpenviking()
+  const { hook } = mount({}, { services: { openviking: ov, shellSkills: skillProvider } })
   await runHook(hook, { agent, turn: 1, step: 1, signal }, [realUser('u1', '第一次提问')])
-  const before = fetchCalls.length
+  const before = ov.calls.length
 
   const emptyClaim = await runHook(hook, { agent, turn: 1, step: 2, signal }, [
     runtimeContext('rc1', 'Current runtime context.'),
   ])
   assert.equal(emptyClaim.messages.length, 1, 'a step with no fresh user input must not inject')
-  assert.equal(fetchCalls.length, before, 'and must not retrieve again')
-  console.log('case 3  ok  tool-continuation step neither retrieves nor injects')
+  assert.equal(ov.calls.length, before, 'and must not retrieve again')
+  console.log('case 3  ok  tool-continuation step neither retrieves nor inserts')
 }
 
 // ---------------------------------------------------------------------------
@@ -326,9 +317,8 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
 // ---------------------------------------------------------------------------
 
 {
-  fetchCalls = []
-  fetchImpl = async () => jsonResponse(MEMORY_BODY)
-  const { hook } = mount()
+  const ov = fakeOpenviking()
+  const { hook } = mount({ userTips: '' }, { services: { openviking: ov } })
   const first = await runHook(hook, { agent, turn: 1, step: 1, signal }, [realUser('u1', '同样的提问')])
   const injected = first.messages[1]
 
@@ -348,13 +338,13 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   ])
   assert.equal(repeat.messages.length, 1, 'identical results still on the surface must not be re-sent')
 
-  // Compaction dropped it → inject again, or the model is left without it.
+  // Compaction dropped it → insert again, or the model is left without it.
   const afterCompaction = await runHook(hook, { agent: withSurface([]), turn: 3, step: 1, signal }, [
     realUser('u2b', '同样的提问'),
   ])
-  assert.equal(afterCompaction.messages.length, 2, 'results dropped by compaction must be re-injected')
+  assert.equal(afterCompaction.messages.length, 2, 'results dropped by compaction must be re-inserted')
 
-  // An unreadable session shape must fail safe by injecting.
+  // An unreadable session shape must fail safe by inserting.
   const unknownShape = await runHook(
     hook,
     { agent: { id: 'session-1', session: { header: { cwd: root } } }, turn: 4, step: 1, signal },
@@ -362,7 +352,7 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   )
   assert.equal(unknownShape.messages.length, 2, 'an unreadable session must not silently starve the model')
 
-  console.log('case 4  ok  surface-aware dedupe (skip / re-inject / fail-safe)')
+  console.log('case 4  ok  surface-aware dedupe (skip / re-insert / fail-safe)')
 }
 
 // ---------------------------------------------------------------------------
@@ -370,170 +360,165 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
 // ---------------------------------------------------------------------------
 
 {
-  fetchCalls = []
-  const { hook } = mount()
+  const ov = fakeOpenviking()
+  const { hook } = mount({}, { services: { openviking: ov } })
   const otherPluginOnly = await runHook(hook, { agent, turn: 1, step: 1, signal }, [
     runtimeContext('rc2', 'someone else injected this'),
   ])
   assert.equal(otherPluginOnly.messages.length, 1)
-  assert.equal(fetchCalls.length, 0, 'only source.kind "user" counts as real input')
+  assert.equal(ov.calls.length, 0, 'only source.kind "user" counts as real input')
   console.log('case 5  ok  only genuine user input triggers retrieval')
 }
 
 // ---------------------------------------------------------------------------
-// Case 6 — the enable switch short-circuits before any request.
+// Case 6 — the master switch short-circuits before any source runs.
 // ---------------------------------------------------------------------------
 
 {
-  fetchCalls = []
-  const { hook } = mount({ enabled: false })
+  const ov = fakeOpenviking()
+  const { hook } = mount({ enabled: false }, { services: { openviking: ov, shellSkills: skillProvider } })
   const disabled = await runHook(hook, { agent, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   assert.equal(disabled.messages.length, 1)
-  assert.equal(fetchCalls.length, 0, 'a disabled plugin must not touch the network')
-  console.log('case 6  ok  enabled=false short-circuits before fetch')
+  assert.equal(ov.calls.length, 0, 'a disabled plugin must not touch the network')
+  console.log('case 6  ok  enabled=false short-circuits before any source runs')
 }
 
 // ---------------------------------------------------------------------------
-// Case 7 — a blank host disables retrieval without disabling the plugin.
+// Case 7 — the sub-switches silence one block each.
 // ---------------------------------------------------------------------------
 
 {
-  fetchCalls = []
-  const { hook } = mount({ 'ovHost': '' })
-  const noHost = await runHook(hook, { agent, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-  assert.equal(noHost.messages.length, 1)
-  assert.equal(fetchCalls.length, 0)
-  console.log('case 7  ok  blank host injects nothing and fetches nothing')
+  const build = (overrides) => {
+    const ov = fakeOpenviking()
+    const { hook } = mount(overrides, { services: { openviking: ov, shellSkills: skillProvider } })
+    return { ov, hook }
+  }
+
+  {
+    const { ov, hook } = build({ ovEnabled: false })
+    const out = await runHook(hook, { agent: { id: 's7a' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+    assert.deepEqual(
+      out.messages.slice(1).map((message) => message.source.provider),
+      ['skills', 'session'],
+      'ovEnabled=false removes both OpenViking blocks',
+    )
+    assert.equal(ov.calls.length, 0, 'and never asks the service')
+  }
+
+  {
+    const { hook } = build({ skillList: false })
+    const out = await runHook(hook, { agent: { id: 's7b' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+    assert.deepEqual(
+      out.messages.slice(1).map((message) => message.source.provider),
+      ['openviking', 'session'],
+      'skillList=false removes the catalog',
+    )
+  }
+
+  {
+    const { hook } = build({ userTipsEnabled: false })
+    const out = await runHook(hook, { agent: { id: 's7c' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+    assert.deepEqual(
+      out.messages.slice(1).map((message) => message.source.provider),
+      ['skills', 'openviking'],
+      'userTipsEnabled=false removes the tips block',
+    )
+  }
+
+  console.log('case 7  ok  ovEnabled / skillList / userTipsEnabled each silence their own block')
 }
 
 // ---------------------------------------------------------------------------
-// Case 8 — a host that already carries scheme and port is accepted as typed.
+// Case 8 — a missing OpenViking plugin degrades to "no memories".
 // ---------------------------------------------------------------------------
 
 {
-  fetchCalls = []
-  fetchImpl = async () => jsonResponse({ result: [] })
-  const { hook } = mount({ 'ovHost': 'https://ov.example.com:8443/' })
-  await runHook(hook, { agent: { id: 's2' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-  assert.equal(fetchCalls[0]?.url, 'https://ov.example.com:8443/api/v1/search/find')
-  console.log('case 8  ok  scheme and port are honoured when typed into the host field')
+  const { hook } = mount()
+  const out = await runHook(hook, { agent: { id: 's8' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  assert.deepEqual(
+    out.messages.map((message) => message.source?.provider ?? 'user'),
+    ['user', 'session'],
+    'without the openviking service only the tips block is inserted',
+  )
+
+  // A service that reports itself unconfigured is not asked either.
+  const unconfigured = fakeOpenviking()
+  unconfigured.status = () => ({ configured: false })
+  const second = mount({}, { services: { openviking: unconfigured } })
+  const out2 = await runHook(second.hook, { agent: { id: 's8b' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  assert.equal(out2.messages.length, 2, 'an unconfigured backend contributes nothing')
+  assert.equal(unconfigured.calls.length, 0)
+  console.log('case 8  ok  a missing or unconfigured backend injects nothing and never errors')
 }
 
 // ---------------------------------------------------------------------------
-// Case 8b — abstractChars 0 keeps each abstract whole; the block cap still applies.
-// ---------------------------------------------------------------------------
-
-{
-  fetchCalls = []
-  fetchImpl = async () => jsonResponse(MEMORY_BODY)
-  const { hook } = mount({ 'ovAbstractChars': 0 })
-  const whole = await runHook(hook, { agent: { id: 's5' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-  const text = whole.messages[1].content[0].text
-  assert.ok(text.includes('结尾标记'), 'abstractChars=0 keeps the abstract whole')
-  assert.ok(!text.includes('…'), 'and marks no cut')
-  console.log('case 8b ok  abstractChars=0 disables the per-entry cut')
-}
-
-// ---------------------------------------------------------------------------
-// Case 9 — failures degrade to "inject nothing" and never break the turn.
+// Case 9 — failures degrade to "insert nothing" and never break the turn.
 // ---------------------------------------------------------------------------
 
 {
   const failures = [
-    ['HTTP 401', async () => jsonResponse({ error: 'unauthorized' }, 401)],
-    ['HTTP 500', async () => jsonResponse({}, 500)],
-    [
-      'unparseable body',
-      async () => ({
-        ok: true,
-        status: 200,
-        json: async () => {
-          throw new Error('bad json')
-        },
-      }),
-    ],
-    [
-      'network error',
-      async () => {
-        throw new Error('ECONNREFUSED')
-      },
-    ],
-    ['never settles', () => new Promise(() => {})],
+    ['HTTP 401', new Error('find HTTP 401')],
+    ['network error', new Error('ECONNREFUSED')],
+    ['bad payload', new Error('bad json')],
   ]
-  for (const [label, impl] of failures) {
-    fetchCalls = []
-    fetchImpl = impl
-    // A short timeout keeps the "never settles" case quick.
-    const { hook, ctx } = mount({ timeoutMs: 60 })
-    const survived = await runHook(hook, { agent, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-    assert.equal(survived.messages.length, 1, `${label}: must degrade to no injection`)
+  for (const [label, error] of failures) {
+    const ov = fakeOpenviking({ failWith: error })
+    const { hook, ctx } = mount({}, { services: { openviking: ov, shellSkills: skillProvider } })
+    const survived = await runHook(hook, { agent: { id: 's9' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+    assert.equal(survived.messages.length, 3, `${label}: the other blocks still land`)
+    assert.ok(
+      survived.messages.every((message) => message.source?.provider !== 'openviking'),
+      `${label}: the failing source inserts nothing`,
+    )
     assert.ok(
       ctx.logs.some(([level]) => level === 'warn'),
       `${label}: the failure must be logged as a warning`,
     )
   }
 
-  // An empty result is an ordinary outcome, not a failure: nothing to inject,
-  // nothing to warn about.
-  fetchCalls = []
-  fetchImpl = async () => jsonResponse({ result: { memories: [] } })
-  const { hook, ctx } = mount()
-  const empty = await runHook(hook, { agent, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-  assert.equal(empty.messages.length, 1, 'an empty result injects nothing')
+  // An empty result is an ordinary outcome, not a failure.
+  const empty = fakeOpenviking({ text: '' })
+  const quiet = mount({ userTips: '' }, { services: { openviking: empty } })
+  const out = await runHook(quiet.hook, { agent: { id: 's9b' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  assert.equal(out.messages.length, 1, 'an empty result inserts nothing')
   assert.equal(
-    ctx.logs.some(([level]) => level === 'warn'),
+    quiet.ctx.logs.some(([level]) => level === 'warn'),
     false,
     'an empty result is not a failure and must not warn',
   )
 
-  console.log('case 9  ok  failures warn and degrade; an empty result is silent')
+  // A source that never settles is bounded by timeoutMs.
+  const stalling = {
+    status: () => ({ configured: true }),
+    find: () => new Promise(() => {}),
+  }
+  const stalled = mount({ timeoutMs: 40, userTips: '' }, { services: { openviking: stalling } })
+  const bounded = await runHook(stalled.hook, { agent: { id: 's9c' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  assert.equal(bounded.messages.length, 1, 'a stalled source is abandoned at the deadline')
+  assert.ok(stalled.ctx.logs.some(([level]) => level === 'warn'))
+
+  console.log('case 9  ok  failures warn and degrade; empty results are silent; stalls are bounded')
 }
 
 // ---------------------------------------------------------------------------
-// Case 10 — a turn cancelled mid-retrieval is not injected into.
+// Case 10 — a turn cancelled mid-retrieval is not inserted into.
 // ---------------------------------------------------------------------------
 
 {
-  fetchCalls = []
-  fetchImpl = async () => jsonResponse(MEMORY_BODY)
-  const { hook } = mount()
+  const ov = fakeOpenviking()
+  const { hook } = mount({}, { services: { openviking: ov } })
   const aborted = new AbortController()
   aborted.abort()
   const afterAbort = await runHook(hook, { agent, turn: 1, step: 1, signal: aborted.signal }, [
     realUser('u1', 'too late'),
   ])
   assert.equal(afterAbort.messages.length, 1)
-  assert.equal(fetchCalls.length, 0)
-  console.log('case 10 ok  an already-aborted turn is not injected into')
+  assert.equal(ov.calls.length, 0)
+  console.log('case 10 ok  an already-aborted turn is not inserted into')
 }
 
 // ---------------------------------------------------------------------------
-// Case 11 — a live settings edit is observed without remounting.
-// ---------------------------------------------------------------------------
-
-{
-  fetchCalls = []
-  fetchImpl = async () => jsonResponse({ result: [] })
-  const { hook, config } = mount()
-  await runHook(hook, { agent: { id: 's3' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-  assert.equal(JSON.parse(fetchCalls[0].init.body).limit, 3)
-
-  if (typeof config['ovLimit']?.set === 'function') {
-    config['ovLimit'].set(7)
-    await runHook(hook, { agent: { id: 's4' }, turn: 1, step: 1, signal }, [realUser('u2', 'hi again')])
-    assert.equal(
-      JSON.parse(fetchCalls[1].init.body).limit,
-      7,
-      'configuration is read per turn, so a settings edit applies without a restart',
-    )
-    console.log('case 11 ok  a live settings edit applies from the next turn')
-  } else {
-    console.log('case 11 skip live-ref setter unavailable in this schemastery build')
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Case 12 — disposition removes both listeners.
+// Case 11 — disposition removes every listener.
 // ---------------------------------------------------------------------------
 
 {
@@ -541,11 +526,11 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   assert.equal(ctx.listeners.length, 3, 'agent/pre-step plus agent/disposed plus the warning intake')
   dispose()
   assert.equal(ctx.listeners.length, 0)
-  console.log('case 12 ok  the returned disposer unregisters every listener')
+  console.log('case 11 ok  the returned disposer unregisters every listener')
 }
 
 // ---------------------------------------------------------------------------
-// Case 13 — the browser half registers the right page, keyed by the package.
+// Case 12 — the browser half: three sub-switches plus the tips text.
 // ---------------------------------------------------------------------------
 
 {
@@ -574,17 +559,17 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
       format: (v) => (typeof v === 'string' ? v : ''),
       parse: (t) => ({ kind: 'set', value: t }),
     }),
-    settingsNumberField: (field) => ({
-      field,
-      format: (v) => (typeof v === 'number' ? String(v) : ''),
-      parse: (t) => ({ kind: 'set', value: Number(t) }),
-    }),
   }
   class FakeFormModel {
-    constructor(scope, fieldSpecs, secretSpecs = []) {
+    constructor(scope, fieldSpecs) {
       this.specs = new Map(fieldSpecs.map((s) => [s.field, s]))
-      this.secretSpecs = new Map(secretSpecs.map((s) => [s.field, s]))
-      this.values = {}
+      this.values = {
+        enabled: true,
+        ovEnabled: true,
+        ovProfile: false,
+        skillList: true,
+        userTipsEnabled: true,
+      }
     }
     bind(project) {
       this.project = project
@@ -607,7 +592,6 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
     Switch: 'Switch',
     SettingsForm: 'SettingsForm',
     SettingsValueField: 'SettingsValueField',
-    SettingsSecretField: 'SettingsSecretField',
     SettingsFormModel: FakeFormModel,
   }
   const requireStub = (specifier) => {
@@ -617,7 +601,7 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   }
 
   const clientExports = definition.factory(requireStub)
-  assert.deepEqual(clientExports.inject, ['slots', 'locale', 'remote', 'remote.credentials', 'configForms'])
+  assert.deepEqual(clientExports.inject, ['slots', 'locale', 'configForms'])
 
   const registered = []
   const localeDicts = []
@@ -657,13 +641,6 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
         return () => {}
       },
     },
-    remote: {
-      $on: () => () => {},
-      credentials: {
-        describe: async () => ({ ok: true, value: {} }),
-        set: async () => {},
-      },
-    },
   }
 
   clientExports.apply(clientCtx)
@@ -681,7 +658,6 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   assert.ok(localeDicts[0].dicts.en?.title && localeDicts[0].dicts.zh?.title, 'both locales are supplied')
 
   // The summary view is what the Plugins list shows before the card is opened.
-  // The hook is read first and unconditionally, exactly as the shipped pages do.
   const summary = registered[0].component({
     view: 'summary',
     t: (key) => key,
@@ -689,11 +665,44 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   })
   assert.equal(typeof summary, 'string')
 
-  console.log('case 13 ok  browser half registers plugins.bundle.config keyed by the package name')
+  // The card must offer the master switch plus one switch per block, and the
+  // tips text stays editable next to its switch.
+  const labels = []
+  const ids = []
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return
+    if (node.type === 'Switch') labels.push(node.props.label)
+    if (node.props?.id) ids.push(node.props.id)
+    for (const child of Array.isArray(node.props?.children) ? node.props.children : []) walk(child)
+  }
+  walk(
+    registered[0].component({
+      view: 'form',
+      t: (key) => key,
+      useInjectSettingsCard: (select) => select({
+        available: true,
+        writable: true,
+        enabled: true,
+        ov: true,
+        ovProfile: false,
+        skills: true,
+        tips: true,
+        tipsText: { text: '', overridden: false, invalid: false },
+      }),
+      save: () => {},
+      discard: () => {},
+      edit: () => {},
+      resetField: () => {},
+    }),
+  )
+  assert.deepEqual(labels, ['enabled', 'ov', 'ovProfile', 'skills', 'tips'], 'one switch per injected block')
+  assert.deepEqual(ids, ['inject-config-user-tips'], 'the tips text rides the same form')
+
+  console.log('case 12 ok  browser half registers four block switches plus the master switch')
 }
 
 // ---------------------------------------------------------------------------
-// Case 14 — a second source rides the same channel: one message each.
+// Case 13 — a second source rides the same channel: one message each.
 // ---------------------------------------------------------------------------
 
 {
@@ -707,11 +716,10 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   }
   SOURCES.push(fakeSource)
   try {
-    fetchCalls = []
-    fetchImpl = async () => jsonResponse(MEMORY_BODY)
-    const { hook } = mount()
-    const both = await runHook(hook, { agent: { id: 's6' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-    assert.equal(both.messages.length, 3, 'each enabled source appends exactly one message')
+    const ov = fakeOpenviking()
+    const { hook } = mount({ userTips: '' }, { services: { openviking: ov } })
+    const both = await runHook(hook, { agent: { id: 's13' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+    assert.equal(both.messages.length, 3, 'each enabled source inserts exactly one message')
     assert.equal(both.messages[0].source.kind, 'user', 'the real input passes through untouched')
     // Sources run in registry order, each carrying its own provider/form.
     assert.equal(both.messages[1].source.provider, 'openviking')
@@ -719,14 +727,14 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
     assert.equal(both.messages[2].source.provider, 'fake')
     assert.equal(both.messages[2].source.form, 'notice')
     assert.equal(both.messages[2].content[0].text, NOTICE)
-    console.log('case 14 ok  a second source injects its own message through the shared channel')
+    console.log('case 13 ok  a second source inserts its own message through the shared channel')
   } finally {
     SOURCES.pop()
   }
 }
 
 // ---------------------------------------------------------------------------
-// Case 15 — sources run concurrently, while output keeps registry order.
+// Case 14 — sources run concurrently, while output keeps registry order.
 // ---------------------------------------------------------------------------
 
 {
@@ -758,14 +766,12 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   }
   SOURCES.push(slow, fast)
   try {
-    fetchCalls = []
-    fetchImpl = async () => jsonResponse({ result: { memories: [] } })
-    const { hook } = mount()
-    const out = await runHook(hook, { agent: { id: 's15' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-    assert.equal(out.messages.length, 3, 'both sources inject')
+    const { hook } = mount({ userTips: '', ovEnabled: false }, {})
+    const out = await runHook(hook, { agent: { id: 's14' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+    assert.equal(out.messages.length, 3, 'both sources insert')
     assert.equal(out.messages[1].content[0].text, 'slow done', 'messages keep registry order')
     assert.equal(out.messages[2].content[0].text, 'fast done')
-    console.log('case 15 ok  sources run concurrently and messages keep registry order')
+    console.log('case 14 ok  sources run concurrently and messages keep registry order')
   } finally {
     SOURCES.pop()
     SOURCES.pop()
@@ -773,29 +779,7 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
 }
 
 // ---------------------------------------------------------------------------
-// Case 16 — a timed-out source is aborted, not merely stopped waiting.
-// ---------------------------------------------------------------------------
-
-{
-  fetchCalls = []
-  let requestSignal
-  fetchImpl = async (_url, init) => {
-    requestSignal = init.signal
-    return new Promise((_resolve, reject) => {
-      init.signal.addEventListener('abort', () => reject(new Error('aborted by deadline')))
-    })
-  }
-  const { hook, ctx } = mount({ timeoutMs: 40 })
-  const out = await runHook(hook, { agent: { id: 's16' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-  assert.equal(out.messages.length, 1, 'a timed-out source injects nothing')
-  assert.ok(requestSignal, 'the request carries an abort signal')
-  assert.equal(requestSignal.aborted, true, 'the per-source deadline aborts the request itself')
-  assert.ok(ctx.logs.some(([level]) => level === 'warn'), 'and the degradation is logged')
-  console.log('case 16 ok  a timed-out source is aborted and the step continues')
-}
-
-// ---------------------------------------------------------------------------
-// Case 17 — totalMaxChars caps a whole step, earliest source first.
+// Case 15 — totalMaxChars caps a whole step, earliest source first.
 // ---------------------------------------------------------------------------
 
 {
@@ -806,17 +790,15 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
     { id: 'b', provider: 'b', form: 'notice', enabled: () => true, collect: async () => second },
   )
   try {
-    fetchCalls = []
-    fetchImpl = async () => jsonResponse({ result: { memories: [] } })
-    const { hook } = mount({ totalMaxChars: 150 })
-    const out = await runHook(hook, { agent: { id: 's17' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+    const { hook } = mount({ totalMaxChars: 150, userTips: '', ovEnabled: false }, {})
+    const out = await runHook(hook, { agent: { id: 's15' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
     const a = out.messages[1].content[0].text
     const b = out.messages[2].content[0].text
     assert.equal(a, first, 'the first source spends its full share')
     assert.ok(b.startsWith('B'.repeat(50)), 'the second source receives the remaining 50 characters')
     assert.ok(!b.startsWith('B'.repeat(51)), 'and not one character more')
     assert.match(b, /truncated by dsh-inject-context/)
-    console.log('case 17 ok  totalMaxChars caps the step and serves sources in order')
+    console.log('case 15 ok  totalMaxChars caps the step and serves sources in order')
   } finally {
     SOURCES.pop()
     SOURCES.pop()
@@ -824,55 +806,52 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
 }
 
 // ---------------------------------------------------------------------------
-// Case 18 — dedupe survives a restart: it is derived from the session log.
+// Case 16 — dedupe survives a restart: it is derived from the session log.
 // ---------------------------------------------------------------------------
 
 {
-  fetchCalls = []
-  fetchImpl = async () => jsonResponse(MEMORY_BODY)
-  const first = mount()
-  const injectedRun = await runHook(first.hook, { agent: { id: 's18' }, turn: 1, step: 1, signal }, [realUser('u1', '同样的提问')])
+  const ov = fakeOpenviking()
+  const first = mount({ userTips: '' }, { services: { openviking: ov } })
+  const injectedRun = await runHook(first.hook, { agent: { id: 's16' }, turn: 1, step: 1, signal }, [
+    realUser('u1', '同样的提问'),
+  ])
   const injected = injectedRun.messages[1]
 
   // A fresh mount has an empty ledger, exactly like a post-restart process.
-  const restarted = mount()
+  const restarted = mount({ userTips: '' }, { services: { openviking: ov } })
   const session = {
     header: { cwd: root },
     snapshotEvents: () => [{ type: 'user/message', seq: 3, data: injected }],
     surface: { nodes: [3] },
   }
-  const out = await runHook(restarted.hook, { agent: { id: 's18', session }, turn: 1, step: 1, signal }, [realUser('u1', '同样的提问')])
+  const out = await runHook(restarted.hook, { agent: { id: 's16', session }, turn: 1, step: 1, signal }, [
+    realUser('u1', '同样的提问'),
+  ])
   assert.equal(out.messages.length, 1, 'a restarted process must derive dedupe from the log, not from memory')
-  console.log('case 18 ok  dedupe survives a restart by reading the durable log')
+  console.log('case 16 ok  dedupe survives a restart by reading the durable log')
 }
 
 // ---------------------------------------------------------------------------
-// Case 19 — the memory index rides the first recall and is not rebuilt.
+// Case 17 — the memory index is a separate catalog block, once per session.
 // ---------------------------------------------------------------------------
 
 {
-  fetchCalls = []
-  fetchImpl = async (url) => {
-    if (String(url).includes('/api/v1/fs/tree')) {
-      return jsonResponse({ result: { entries: [{ name: '主题A' }, { title: '主题B' }] } })
-    }
-    return jsonResponse(MEMORY_BODY)
-  }
-  const { hook } = mount({ ovProfile: true, ovUser: 'alice' })
-  const first = await runHook(hook, { agent: { id: 's19' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  const ov = fakeOpenviking()
+  const { hook } = mount({ ovProfile: true, userTips: '' }, { services: { openviking: ov } })
+  const first = await runHook(hook, { agent: { id: 's17' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   assert.equal(first.messages.length, 3, 'the index and the recall are one message each')
-  const indexText = first.messages[1].content[0].text
-  const recallText = first.messages[2].content[0].text
-  assert.equal(first.messages[1].source.form, 'catalog', 'the index is a catalog, not a recall')
-  assert.match(indexText, /记忆索引/)
-  assert.match(indexText, /主题A/)
-  assert.match(indexText, /主题B/)
-  assert.match(recallText, /相关记忆/)
-  assert.ok(!recallText.includes('记忆索引'), 'the index is not merged into the recall')
-  assert.equal(fetchCalls.filter((call) => String(call.url).includes('/api/v1/fs/tree')).length, 1, 'the tree is fetched once')
+  const index = first.messages[1]
+  const recall = first.messages[2]
+  assert.equal(index.source.form, 'catalog', 'the index is a catalog, not a recall')
+  assert.match(index.content[0].text, /## 🧠 记忆索引/)
+  assert.match(index.content[0].text, /主题A/)
+  assertFenced(index.content[0].text, 'index')
+  assert.match(recall.content[0].text, /## 📖 相关记忆/)
+  assert.ok(!recall.content[0].text.includes('记忆索引'), 'the index is not merged into the recall')
+  assert.equal(ov.calls.filter((call) => call.kind === 'profile').length, 1, 'the index is fetched once')
 
-  // The session log already carries the index and the surface still shows both
-  // messages, so the index is not rebuilt and the identical recall is skipped.
+  // The session log already carries the index, so it is not rebuilt and the
+  // identical recall is skipped.
   const session = {
     header: { cwd: root },
     snapshotEvents: () => [
@@ -881,23 +860,30 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
     ],
     surface: { nodes: [5, 6] },
   }
-  const second = await runHook(hook, { agent: { id: 's19', session }, turn: 2, step: 1, signal }, [realUser('u2', 'hi')])
+  const second = await runHook(hook, { agent: { id: 's17', session }, turn: 2, step: 1, signal }, [realUser('u2', 'hi')])
   assert.equal(second.messages.length, 1, 'neither the index nor the identical recall is re-sent')
   assert.equal(
-    fetchCalls.filter((call) => String(call.url).includes('/api/v1/fs/tree')).length,
+    ov.calls.filter((call) => call.kind === 'profile').length,
     1,
     'an index already in the log is never rebuilt',
   )
-  console.log('case 19 ok  the memory index is a separate catalog message and is derived from the log')
+
+  // Off by default.
+  const plain = fakeOpenviking()
+  const off = mount({ userTips: '' }, { services: { openviking: plain } })
+  await runHook(off.hook, { agent: { id: 's17b' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  assert.equal(plain.calls.filter((call) => call.kind === 'profile').length, 0, 'the index is opt-in')
+
+  console.log('case 17 ok  the memory index is a separate catalog block, once per session, opt-in')
 }
 
 // ---------------------------------------------------------------------------
-// Case 20 — step recall queries on the tool result and is off by default.
+// Case 18 — step recall queries on the tool result and is off by default.
 // ---------------------------------------------------------------------------
 
 {
   const toolTurn = {
-    id: 's20',
+    id: 's18',
     session: {
       header: { cwd: root },
       snapshotEvents: () => [
@@ -913,19 +899,18 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
     },
   }
 
-  fetchCalls = []
-  fetchImpl = async () => jsonResponse(MEMORY_BODY)
-  const { hook } = mount({ ovStepRecall: true })
+  const ov = fakeOpenviking()
+  const { hook } = mount({ ovStepRecall: true, userTips: '' }, { services: { openviking: ov } })
   const stepTwo = await runHook(
     hook,
     { agent: toolTurn, turn: 1, step: 2, signal },
     [runtimeContext('rc1', 'Current runtime context.')],
   )
-  assert.equal(fetchCalls.length, 1, 'a tool-continuation step retrieves when step recall is on')
-  const query = JSON.parse(fetchCalls[0].init.body).query
-  assert.match(query, /查一下构建配置/, 'the query carries the turn user text')
-  assert.match(query, /BUILD_TARGET=android/, 'and the tool result')
+  assert.equal(ov.calls.length, 1, 'a tool-continuation step retrieves when step recall is on')
+  assert.match(ov.calls[0].query, /查一下构建配置/, 'the query carries the turn user text')
+  assert.match(ov.calls[0].query, /BUILD_TARGET=android/, 'and the tool result')
   assert.equal(stepTwo.messages.length, 2, 'the step receives its own recall block')
+  assertFenced(stepTwo.messages[stepTwo.messages.length - 1].content[0].text, 'step recall')
 
   // The same step is served once, so a repeated pre-step costs no request.
   const repeated = await runHook(
@@ -933,123 +918,87 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
     { agent: toolTurn, turn: 1, step: 2, signal },
     [runtimeContext('rc1', 'Current runtime context.')],
   )
-  assert.equal(fetchCalls.length, 1, 'the same step is not retrieved twice')
+  assert.equal(ov.calls.length, 1, 'the same step is not retrieved twice')
   assert.equal(repeated.messages.length, 1)
 
   // Off by default: a plain mount must not retrieve on a continuation step.
-  fetchCalls = []
-  const plain = mount()
+  const plain = fakeOpenviking()
+  const off = mount({ userTips: '' }, { services: { openviking: plain } })
   const skipped = await runHook(
-    plain.hook,
+    off.hook,
     { agent: toolTurn, turn: 1, step: 2, signal },
     [runtimeContext('rc1', 'Current runtime context.')],
   )
-  assert.equal(fetchCalls.length, 0, 'step recall is opt-in')
+  assert.equal(plain.calls.length, 0, 'step recall is opt-in')
   assert.equal(skipped.messages.length, 1)
-  console.log('case 20 ok  step recall queries on the tool result and is off by default')
+  console.log('case 18 ok  step recall queries on the tool result and is off by default')
 }
 
 // ---------------------------------------------------------------------------
-// Case 21 — user tips are injected once per session, config or env.
+// Case 19 — user tips are inserted once per session, config or env.
 // ---------------------------------------------------------------------------
 
 {
-  fetchCalls = []
-  fetchImpl = async () => jsonResponse({ result: { memories: [] } })
-  const { hook } = mount({ userTips: '回答用中文，并给出命令示例' })
-  const first = await runHook(hook, { agent: { id: 's21' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  const { hook } = mount({ ovEnabled: false })
+  const first = await runHook(hook, { agent: { id: 's19' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   const text = first.messages[1].content[0].text
   assert.match(text, /<user_tips>/, 'the block carries its marker')
   assert.match(text, /回答用中文/)
-  assert.equal(first.messages[1].source.form, 'instructions')
+  assertFenced(text, 'tips')
 
   const session = {
     header: { cwd: root },
     snapshotEvents: () => [{ type: 'user/message', seq: 2, data: first.messages[1] }],
     surface: { nodes: [2] },
   }
-  const second = await runHook(hook, { agent: { id: 's21', session }, turn: 2, step: 1, signal }, [realUser('u2', 'hi again')])
+  const second = await runHook(hook, { agent: { id: 's19', session }, turn: 2, step: 1, signal }, [realUser('u2', 'hi again')])
   assert.equal(second.messages.length, 1, 'tips are delivered once per session')
 
   // The environment variable is the fallback an API gateway uses.
   process.env.USER_TIPS = '这条来自 QQ 通道'
   try {
-    const envMount = mount()
-    const fromEnv = await runHook(envMount.hook, { agent: { id: 's21b' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+    const envMount = mount({ ovEnabled: false, userTips: '' })
+    const fromEnv = await runHook(envMount.hook, { agent: { id: 's19b' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
     assert.match(fromEnv.messages[1].content[0].text, /这条来自 QQ 通道/)
   } finally {
     delete process.env.USER_TIPS
   }
-  console.log('case 21 ok  user tips are once-per-session and fall back to USER_TIPS')
+  console.log('case 19 ok  user tips are once-per-session and fall back to USER_TIPS')
 }
 
 // ---------------------------------------------------------------------------
-// Case 22 — the skill catalog is supplied by another plugin's service.
+// Case 20 — runtime warnings ride the event into the next step, once.
 // ---------------------------------------------------------------------------
 
 {
-  fetchCalls = []
-  fetchImpl = async () => jsonResponse({ result: { memories: [] } })
-  const skills = {
-    list: async () => [
-      { name: 'file-tools', description: '读写文件' },
-      { name: 'shell', description: '执行命令' },
-    ],
-  }
-  const { hook } = mount({ skillList: true }, { services: { shellSkills: skills } })
-  const first = await runHook(hook, { agent: { id: 's22' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-  const catalog = first.messages[1]
-  assert.equal(catalog.source.form, 'catalog')
-  const text = catalog.content[0].text
-  assert.match(text, /<shell_skills>/, 'the catalog uses its own envelope, not tool-skill\'s')
-  assert.doesNotMatch(text, /<available_skills>/, 'the built-in catalog envelope is left untouched')
-  assert.match(text, /- `file-tools`: 读写文件/)
-  assert.match(text, /- `shell`: 执行命令/)
-
-  // No provider registered → nothing is injected, even when enabled.
-  const noProvider = mount({ skillList: true })
-  const missing = await runHook(noProvider.hook, { agent: { id: 's22b' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-  assert.equal(missing.messages.length, 1)
-
-  // On by default, so a provider alone injects the catalog.
-  const on = mount({}, { services: { shellSkills: skills } })
-  const injected = await runHook(on.hook, { agent: { id: 's22c' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-  assert.equal(injected.messages.length, 2, 'the catalog rides alongside the user message')
-
-  // An explicit opt-out still wins.
-  const off = mount({ skillList: false }, { services: { shellSkills: skills } })
-  const disabled = await runHook(off.hook, { agent: { id: 's22d' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-  assert.equal(disabled.messages.length, 1)
-  console.log('case 22 ok  the skill catalog is read from the provider service, on by default, in its own envelope')
-}
-
-// ---------------------------------------------------------------------------
-// Case 23 — runtime warnings ride the event into the next step, once.
-// ---------------------------------------------------------------------------
-
-{
-  fetchCalls = []
-  fetchImpl = async () => jsonResponse({ result: { memories: [] } })
-  const { hook, ctx } = mount()
+  const { hook, ctx } = mount({ ovEnabled: false, userTips: '' })
   const intake = ctx.listeners.find((listener) => listener.event === WARNING_EVENT)
   assert.ok(intake, 'the plugin listens for runtime warnings')
-  intake.handler({ agent: { id: 's23' }, text: '工具调用已达上限，不要再调用工具' })
+  intake.handler({ agent: { id: 's20' }, text: '工具调用已达上限，不要再调用工具' })
 
-  const out = await runHook(hook, { agent: { id: 's23' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  const out = await runHook(hook, { agent: { id: 's20' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   const warning = out.messages[1]
   assert.equal(warning.source.form, 'notice', 'a warning is a one-off notice')
   assert.equal(typeof warning.source.summary, 'string', 'a notice must carry its one-line account')
   assert.match(warning.content[0].text, /<user_warning>/)
   assert.match(warning.content[0].text, /不要再调用工具/)
+  assertFenced(warning.content[0].text, 'warning')
 
-  const drained = await runHook(hook, { agent: { id: 's23' }, turn: 2, step: 1, signal }, [realUser('u2', 'hi again')])
+  const drained = await runHook(hook, { agent: { id: 's20' }, turn: 2, step: 1, signal }, [realUser('u2', 'hi again')])
   assert.equal(drained.messages.length, 1, 'a warning is consumed by the step that received it')
 
-  console.log('case 23 ok  runtime warnings are event-fed, notice-form, and consumed once')
+  // `userWarning=false` makes the intake drop the event instead of queueing it.
+  const off = mount({ ovEnabled: false, userTips: '', userWarning: false })
+  const offIntake = off.ctx.listeners.find((listener) => listener.event === WARNING_EVENT)
+  offIntake.handler({ agent: { id: 's20b' }, text: '不该出现' })
+  const ignored = await runHook(off.hook, { agent: { id: 's20b' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  assert.equal(ignored.messages.length, 1, 'userWarning=false keeps warnings out of the turn')
+
+  console.log('case 20 ok  runtime warnings are event-fed, notice-form, fenced, and consumed once')
 }
 
 // ---------------------------------------------------------------------------
-// Case 24 — the public source interface validates and can be unregistered.
+// Case 21 — the public source interface validates and can be unregistered.
 // ---------------------------------------------------------------------------
 
 {
@@ -1057,8 +1006,6 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   assert.throws(() => defineSource({ id: 'x', provider: 'x', form: 'notice' }), /enabled/, 'and its gate')
   assert.throws(() => defineSource({ id: 'x', provider: 'x', form: 'notice', enabled: () => true }), /collect/, 'and its collector')
 
-  fetchCalls = []
-  fetchImpl = async () => jsonResponse({ result: { memories: [] } })
   const custom = defineSource({
     id: 'custom',
     provider: 'custom',
@@ -1069,8 +1016,8 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
   })
   const unregister = registerSource(custom)
   try {
-    const { hook } = mount()
-    const out = await runHook(hook, { agent: { id: 's24' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+    const { hook } = mount({ ovEnabled: false, userTips: '' })
+    const out = await runHook(hook, { agent: { id: 's21' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
     assert.equal(out.messages.length, 2)
     assert.equal(out.messages[1].content[0].text, 'custom source text')
     assert.equal(out.messages[1].source.summary, 'custom')
@@ -1078,14 +1025,13 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, cred
     unregister()
   }
   assert.equal(SOURCES.includes(custom), false, 'the disposer removes the source')
-  console.log('case 24 ok  defineSource validates and registerSource returns a disposer')
+  console.log('case 21 ok  defineSource validates and registerSource returns a disposer')
 }
 
 // ---------------------------------------------------------------------------
 // Cleanup
 // ---------------------------------------------------------------------------
 
-globalThis.fetch = realFetch
 delete globalThis.window
 await rm(root, { recursive: true, force: true })
 
