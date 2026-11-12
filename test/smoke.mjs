@@ -1039,6 +1039,47 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
 }
 
 // ---------------------------------------------------------------------------
+// Case 22 — the catalog is names plus one-line descriptions; usage stays out.
+// ---------------------------------------------------------------------------
+
+{
+  // A provider that hands back more than the contract: descriptions with the
+  // usage block pasted onto them, plus a `usage` field and a `get()` that
+  // would answer with it. The catalog must stay a pointer.
+  const long = '很长的说明'.repeat(80)
+  const leaky = {
+    asked: [],
+    list: async () => [
+      { name: 'idrac', description: 'Dell iDRAC 带外管理\n# usage:\n  arguments.action = status | power', usage: '# usage:\n  arguments.action = status | power' },
+      { name: 'weather', description: 'wttr.in 天气查询\narguments.location = 地点', usage: 'arguments.location = 地点' },
+      { name: 'verbose', description: long },
+    ],
+    get: async (name) => {
+      leaky.asked.push(name)
+      return { name, description: 'x', usage: '# usage:\n  arguments.x = 1' }
+    },
+  }
+  const { hook } = mount({ ovEnabled: false, userTips: '' }, { services: { shellSkills: leaky } })
+  const out = await runHook(hook, { agent: { id: 's22' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
+  const text = out.messages[1].content[0].text
+
+  // One line per skill, description only — the usage tail of each description
+  // is dropped rather than flattened into the line.
+  assert.match(text, /- `idrac`: Dell iDRAC 带外管理$|^- `idrac`: Dell iDRAC 带外管理\n/m)
+  assert.match(text, /- `weather`: wttr\.in 天气查询\n/)
+  assert.doesNotMatch(text, /# usage:/, 'no usage header reaches the catalog')
+  assert.doesNotMatch(text, /arguments\./, 'no argument documentation either')
+  assert.equal(leaky.asked.length, 0, 'get() is never called: the catalog does not read usage')
+
+  // Every rendered line is a single line, and none runs past the cap.
+  const lines = text.split('\n').filter((line) => line.startsWith('- `'))
+  assert.equal(lines.length, 3, 'one line per skill')
+  for (const line of lines) assert.ok(line.length <= 220, `tight line: ${line.length} chars`)
+
+  console.log('case 22 ok  the catalog carries names and one-line descriptions only — usage never crosses')
+}
+
+// ---------------------------------------------------------------------------
 // Cleanup
 // ---------------------------------------------------------------------------
 
