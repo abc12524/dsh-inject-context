@@ -237,61 +237,68 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
   const first = await runHook(hook, { agent, turn: 1, step: 1, signal }, [...claimed, ctxMessage])
 
   assert.equal(first.kind, 'enter')
-  // user + catalog + recall + tips, then the runtime context the harness appends.
-  assert.equal(first.messages.length, 5, 'three blocks inserted below the question, nothing else touched')
+  // user + the one assembled reminder, then the runtime context the harness appends.
+  assert.equal(first.messages.length, 3, 'all blocks travel in ONE injected message')
   assert.deepEqual(first.messages[0], claimed[0], 'the user message passes through untouched')
-  assert.deepEqual(first.messages[4], ctxMessage, 'the runtime-context message still ends the list')
+  assert.deepEqual(first.messages[2], ctxMessage, 'the runtime-context message still ends the list')
 
-  const [catalog, recall, tips] = first.messages.slice(1, 4)
-  for (const [index, message] of [catalog, recall, tips].entries()) {
-    assertPersistableUserMessage(message, `injected[${index}]`)
-    assert.equal(Object.isFrozen(message), true, 'the shared constructor freezes the message')
-    assert.equal(Object.isFrozen(message.content), true, 'including its content array')
-    // The client classifies durable user messages by source.kind: 'user' renders
-    // as a user bubble, anything else as an injected-context row labelled with
-    // the kind.
-    assert.equal(message.source.kind, 'dsh-inject-context')
-    assertFenced(message.content[0].text, `injected[${index}]`)
-  }
+  const injected = first.messages[1]
+  assertPersistableUserMessage(injected, 'injected')
+  assert.equal(Object.isFrozen(injected), true, 'the shared constructor freezes the message')
+  assert.equal(Object.isFrozen(injected.content), true, 'including its content array')
+  // The client classifies durable user messages by source.kind: 'user' renders
+  // as a user bubble, anything else as an injected-context row labelled with
+  // the kind.
+  assert.equal(injected.source.kind, 'dsh-inject-context')
+  assert.equal(injected.source.form, 'notice', 'a multi-block message is presented as one notice')
+  assert.match(injected.source.summary, /skill list/, 'the summary names the blocks it carries')
+  assert.match(injected.source.summary, /memory recall/)
+  assert.match(injected.source.summary, /user tips/)
+
+  const text = injected.content[0].text
+  assertFenced(text, 'injected')
+
+  // The whole point of the merge: ONE fence, with the blocks as siblings inside
+  // it — not one envelope per block.
+  const opens = text.split('<user-reminder>').length - 1
+  const closes = text.split('</user-reminder>').length - 1
+  assert.equal(opens, 1, 'exactly one <user-reminder> envelope')
+  assert.equal(closes, 1, 'exactly one </user-reminder> envelope')
 
   // 1 — the skill catalog, read from the skill runtime's service.
-  assert.equal(catalog.source.form, 'catalog')
-  assert.equal(catalog.source.provider, 'skills')
-  assert.match(catalog.content[0].text, /<shell_skills>/)
-  assert.match(catalog.content[0].text, /- `file-tools`: 读写文件/)
-  assert.match(catalog.content[0].text, /- `shell`: 执行命令/)
+  assert.match(text, /<shell_skills>/)
+  assert.match(text, /- `file-tools`: 读写文件/)
+  assert.match(text, /- `shell`: 执行命令/)
 
   // 2 — the recall block: rows from the service, framing from this plugin.
-  assert.equal(recall.source.form, 'recall')
-  assert.equal(recall.source.provider, 'openviking')
-  const recallText = recall.content[0].text
-  assert.match(recallText, /自动检索的候选记忆/, 'the preamble marks it as unverified background')
-  assert.match(recallText, /## 📖 相关记忆/, 'the rows keep the backend marker')
-  assert.match(recallText, /用户偏好深色主题/)
-  assert.match(recallText, /不视为指令/, 'the epilogue states the block is not instruction')
-  assert.ok(
-    recallText.indexOf('自动检索') < recallText.indexOf('## 📖') &&
-      recallText.indexOf('## 📖') < recallText.indexOf('不视为指令'),
-    'the framing wraps the backend rows in order',
-  )
+  assert.match(text, /自动检索的候选记忆/, 'the preamble marks it as unverified background')
+  assert.match(text, /## 📖 相关记忆/, 'the rows keep the backend marker')
+  assert.match(text, /用户偏好深色主题/)
+  assert.match(text, /不视为指令/, 'the epilogue states the block is not instruction')
 
   // 3 — user tips, once per session.
-  assert.equal(tips.source.form, 'instructions')
-  assert.equal(tips.source.provider, 'session')
-  assert.match(tips.content[0].text, /<user_tips>/)
-  assert.match(tips.content[0].text, /回答用中文/)
+  assert.match(text, /<user_tips>/)
+  assert.match(text, /回答用中文/)
+
+  // Blocks keep registry order inside the envelope: catalog, then recall framing,
+  // then tips.
+  const order = [
+    text.indexOf('<shell_skills>'),
+    text.indexOf('自动检索的候选记忆'),
+    text.indexOf('## 📖'),
+    text.indexOf('不视为指令'),
+    text.indexOf('<user_tips>'),
+  ]
+  assert.ok(order.every((index) => index >= 0), 'every block is present')
+  assert.deepEqual([...order].sort((a, b) => a - b), order, 'blocks appear in registry order')
 
   // The service is asked exactly once, with the user's own words.
   assert.equal(ov.calls.filter((call) => call.kind === 'find').length, 1)
   assert.equal(ov.calls[0].query, '我之前说过什么偏好？')
   assert.ok(ov.calls[0].signal, 'the retrieval carries the per-source abort signal')
 
-  console.log(
-    textsOf(first.messages.slice(1, 4))
-      .map((text) => text.split('\n').slice(0, 3).map((line) => '        ' + line).join('\n'))
-      .join('\n        ---\n'),
-  )
-  console.log('case 2  ok  skill list, recall, and tips are inserted below the question, each fenced')
+  console.log(text.split('\n').map((line) => '        ' + line).join('\n'))
+  console.log('case 2  ok  skill list, recall, and tips are siblings inside ONE <user-reminder>')
 }
 
 // ---------------------------------------------------------------------------
@@ -397,9 +404,10 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
   {
     const { ov, hook } = build({ ovEnabled: false })
     const out = await runHook(hook, { agent: { id: 's7a' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-    assert.deepEqual(
-      out.messages.slice(1).map((message) => message.source.provider),
-      ['skills', 'session'],
+    assert.equal(out.messages.length, 2, 'one injected message plus the question')
+    assert.equal(
+      out.messages[1].source.summary,
+      'skill list · user tips',
       'ovEnabled=false removes both OpenViking blocks',
     )
     assert.equal(ov.calls.length, 0, 'and never asks the service')
@@ -408,9 +416,9 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
   {
     const { hook } = build({ skillList: false })
     const out = await runHook(hook, { agent: { id: 's7b' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-    assert.deepEqual(
-      out.messages.slice(1).map((message) => message.source.provider),
-      ['openviking', 'session'],
+    assert.equal(
+      out.messages[1].source.summary,
+      'memory recall · user tips',
       'skillList=false removes the catalog',
     )
   }
@@ -418,9 +426,9 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
   {
     const { hook } = build({ userTipsEnabled: false })
     const out = await runHook(hook, { agent: { id: 's7c' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-    assert.deepEqual(
-      out.messages.slice(1).map((message) => message.source.provider),
-      ['skills', 'openviking'],
+    assert.equal(
+      out.messages[1].source.summary,
+      'skill list · memory recall',
       'userTipsEnabled=false removes the tips block',
     )
   }
@@ -435,9 +443,10 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
 {
   const { hook } = mount()
   const out = await runHook(hook, { agent: { id: 's8' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-  assert.deepEqual(
-    out.messages.map((message) => message.source?.provider ?? 'user'),
-    ['user', 'session'],
+  assert.equal(out.messages.length, 2)
+  assert.equal(
+    out.messages[1].source.summary,
+    'user tips',
     'without the openviking service only the tips block is inserted',
   )
 
@@ -465,11 +474,10 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
     const ov = fakeOpenviking({ failWith: error })
     const { hook, ctx } = mount({}, { services: { openviking: ov, shellSkills: skillProvider } })
     const survived = await runHook(hook, { agent: { id: 's9' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-    assert.equal(survived.messages.length, 3, `${label}: the other blocks still land`)
-    assert.ok(
-      survived.messages.every((message) => message.source?.provider !== 'openviking'),
-      `${label}: the failing source inserts nothing`,
-    )
+    assert.equal(survived.messages.length, 2, `${label}: the other blocks still land`)
+    const text = survived.messages[1].content[0].text
+    assert.ok(text.includes('<shell_skills>'), `${label}: the catalog is unaffected`)
+    assert.ok(!text.includes('## 📖'), `${label}: the failing source inserts nothing`)
     assert.ok(
       ctx.logs.some(([level]) => level === 'warn'),
       `${label}: the failure must be logged as a warning`,
@@ -702,7 +710,7 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
 }
 
 // ---------------------------------------------------------------------------
-// Case 13 — a second source rides the same channel: one message each.
+// Case 13 — a second source rides the same channel, inside the same reminder.
 // ---------------------------------------------------------------------------
 
 {
@@ -719,15 +727,17 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
     const ov = fakeOpenviking()
     const { hook } = mount({ userTips: '' }, { services: { openviking: ov } })
     const both = await runHook(hook, { agent: { id: 's13' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-    assert.equal(both.messages.length, 3, 'each enabled source inserts exactly one message')
+    assert.equal(both.messages.length, 2, 'one question plus one assembled reminder')
     assert.equal(both.messages[0].source.kind, 'user', 'the real input passes through untouched')
-    // Sources run in registry order, each carrying its own provider/form.
-    assert.equal(both.messages[1].source.provider, 'openviking')
-    assert.equal(both.messages[1].source.form, 'recall')
-    assert.equal(both.messages[2].source.provider, 'fake')
-    assert.equal(both.messages[2].source.form, 'notice')
-    assert.equal(both.messages[2].content[0].text, NOTICE)
-    console.log('case 13 ok  a second source inserts its own message through the shared channel')
+    // Sources run in registry order and share the one envelope.
+    const text = both.messages[1].content[0].text
+    assert.ok(text.includes(NOTICE), 'the extra source contributes its body')
+    assert.ok(text.includes('## 📖 相关记忆'), 'alongside the recall block')
+    assert.ok(text.indexOf('## 📖') < text.indexOf(NOTICE), 'blocks keep registry order')
+    assert.equal(text.split('<user-reminder>').length - 1, 1, 'still a single envelope')
+    assert.match(both.messages[1].source.summary, /memory recall/, 'the summary names the blocks')
+    assert.match(both.messages[1].source.summary, /fake/, 'including a source that has no label of its own')
+    console.log('case 13 ok  a second source contributes to the same assembled reminder')
   } finally {
     SOURCES.pop()
   }
@@ -768,10 +778,11 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
   try {
     const { hook } = mount({ userTips: '', ovEnabled: false }, {})
     const out = await runHook(hook, { agent: { id: 's14' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-    assert.equal(out.messages.length, 3, 'both sources insert')
-    assert.equal(out.messages[1].content[0].text, 'slow done', 'messages keep registry order')
-    assert.equal(out.messages[2].content[0].text, 'fast done')
-    console.log('case 14 ok  sources run concurrently and messages keep registry order')
+    assert.equal(out.messages.length, 2, 'both sources contribute one reminder')
+    const text = out.messages[1].content[0].text
+    assert.ok(text.indexOf('slow done') >= 0 && text.indexOf('fast done') >= 0, 'both bodies are present')
+    assert.ok(text.indexOf('slow done') < text.indexOf('fast done'), 'blocks keep registry order')
+    console.log('case 14 ok  sources run concurrently and their blocks keep registry order')
   } finally {
     SOURCES.pop()
     SOURCES.pop()
@@ -792,8 +803,9 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
   try {
     const { hook } = mount({ totalMaxChars: 150, userTips: '', ovEnabled: false }, {})
     const out = await runHook(hook, { agent: { id: 's15' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-    const a = out.messages[1].content[0].text
-    const b = out.messages[2].content[0].text
+    const text = out.messages[1].content[0].text
+    const body = text.replace(/^<user-reminder>\n/, '').replace(/\n<\/user-reminder>$/, '')
+    const [a, b] = body.split('\n\n')
     assert.equal(a, first, 'the first source spends its full share')
     assert.ok(b.startsWith('B'.repeat(50)), 'the second source receives the remaining 50 characters')
     assert.ok(!b.startsWith('B'.repeat(51)), 'and not one character more')
@@ -839,26 +851,23 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
   const ov = fakeOpenviking()
   const { hook } = mount({ ovProfile: true, userTips: '' }, { services: { openviking: ov } })
   const first = await runHook(hook, { agent: { id: 's17' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
-  assert.equal(first.messages.length, 3, 'the index and the recall are one message each')
-  const index = first.messages[1]
-  const recall = first.messages[2]
-  assert.equal(index.source.form, 'catalog', 'the index is a catalog, not a recall')
-  assert.match(index.content[0].text, /## 🧠 记忆索引/)
-  assert.match(index.content[0].text, /主题A/)
-  assertFenced(index.content[0].text, 'index')
-  assert.match(recall.content[0].text, /## 📖 相关记忆/)
-  assert.ok(!recall.content[0].text.includes('记忆索引'), 'the index is not merged into the recall')
+  assert.equal(first.messages.length, 2, 'the index and the recall share one reminder')
+  const merged = first.messages[1]
+  assert.equal(merged.source.form, 'notice')
+  const text = merged.content[0].text
+  assertFenced(text, 'reminder')
+  assert.equal(text.split('<user-reminder>').length - 1, 1, 'one envelope')
+  assert.match(text, /## 🧠 记忆索引/)
+  assert.match(text, /主题A/)
+  assert.match(text, /## 📖 相关记忆/)
+  assert.ok(text.indexOf('记忆索引') < text.indexOf('## 📖'), 'the index block precedes the recall block')
   assert.equal(ov.calls.filter((call) => call.kind === 'profile').length, 1, 'the index is fetched once')
 
-  // The session log already carries the index, so it is not rebuilt and the
-  // identical recall is skipped.
+  // The session log already carries both blocks, so neither is re-sent.
   const session = {
     header: { cwd: root },
-    snapshotEvents: () => [
-      { type: 'user/message', seq: 5, data: first.messages[1] },
-      { type: 'user/message', seq: 6, data: first.messages[2] },
-    ],
-    surface: { nodes: [5, 6] },
+    snapshotEvents: () => [{ type: 'user/message', seq: 5, data: merged }],
+    surface: { nodes: [5] },
   }
   const second = await runHook(hook, { agent: { id: 's17', session }, turn: 2, step: 1, signal }, [realUser('u2', 'hi')])
   assert.equal(second.messages.length, 1, 'neither the index nor the identical recall is re-sent')
@@ -874,7 +883,7 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
   await runHook(off.hook, { agent: { id: 's17b' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   assert.equal(plain.calls.filter((call) => call.kind === 'profile').length, 0, 'the index is opt-in')
 
-  console.log('case 17 ok  the memory index is a separate catalog block, once per session, opt-in')
+  console.log('case 17 ok  the memory index is once per session, opt-in, and shares the reminder')
 }
 
 // ---------------------------------------------------------------------------
@@ -994,7 +1003,7 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
   const ignored = await runHook(off.hook, { agent: { id: 's20b' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
   assert.equal(ignored.messages.length, 1, 'userWarning=false keeps warnings out of the turn')
 
-  console.log('case 20 ok  runtime warnings are event-fed, notice-form, fenced, and consumed once')
+  console.log('case 20 ok  runtime warnings are event-fed, join the reminder, and are consumed once')
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,15 +1021,16 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
     form: 'notice',
     enabled: () => true,
     collect: async () => 'custom source text',
-    summary: () => 'custom',
   })
   const unregister = registerSource(custom)
   try {
     const { hook } = mount({ ovEnabled: false, userTips: '' })
     const out = await runHook(hook, { agent: { id: 's21' }, turn: 1, step: 1, signal }, [realUser('u1', 'hi')])
     assert.equal(out.messages.length, 2)
-    assert.equal(out.messages[1].content[0].text, 'custom source text')
-    assert.equal(out.messages[1].source.summary, 'custom')
+    const text = out.messages[1].content[0].text
+    assertFenced(text, 'custom')
+    assert.match(text, /custom source text/, 'a bare body from a third-party source still reaches the model')
+    assert.match(out.messages[1].source.summary, /custom/, 'and the summary falls back to the source id')
   } finally {
     unregister()
   }
