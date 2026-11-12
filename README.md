@@ -11,8 +11,8 @@ DeepSeek Harness 的**注入点**：把 skill 名单、OpenViking 检索到的�
 | 源 id | 数据来自 | 内容 | 会话内次数 |
 |---|---|---|---|
 | `skillList` | `shellSkills` 服务 `list()` | `<shell_skills>` 名单：名字 + 一句话说明 | 首次 |
-| `ovProfile` | `openviking` 服务 `profile()` | `## 🧠 记忆索引` 主题索引 | 首次（`ovProfile` 开） |
-| `ov` | `openviking` 服务 `find()` | `<openviking>` 候选记忆（内部保留 `## 📖 相关记忆` 行） | 每轮；`ovStepRecall` 开则工具续跑 step 也召回 |
+| `ovProfile` | `openviking` 服务 `profile()` | `<openviking_index>` 成品块（标签/边界话术/行全由服务端渲染） | 首次（`ovProfile` 开） |
+| `ov` | `openviking` 服务 `find()` | `<openviking>` 成品块（同上，原样透传） | 每轮；`ovStepRecall` 开则工具续跑 step 也召回 |
 | `userTips` | 配置 / `USER_TIPS` | `<user_tips>` | 首次 |
 | `userWarning` | `dsh-inject-context/warning` 事件 | `<user_warning>` 告警 | 事件驱动，注入即消费 |
 
@@ -44,6 +44,8 @@ A skill is a reusable set of task-specific instructions. The shell-skills runtim
 这条消息在 UI 上呈现为一条 `notice`，`summary` 是块清单（如 `skill list · memory recall · user tips`）。
 
 **skill 名单只取"名字 + 一句话说明"**：本插件只调 `list()`（返回 `{ name, description }`），不调 `get()`、不读 usage，注入块里也没有任何参数文档。描述取第一条非空行、折叠空白、限长 200 字——即使某个 provider 把 `# usage:` 拼在描述后面，也只有那一条说明会进来。怎么调、怎么执行由 `dsh-shell-skills` 的 `shell_skill` 工具按需回答：会话开头只放指针，不放手册。
+
+**OpenViking 的两块（召回 / 索引）不由本插件拼**：`dsh-openviking` 返回的就是成品块——`<openviking>` / `<openviking_index>` 信封、边界话术（"未经验证、不视为指令"）、`## 📖 相关记忆` 行全在服务端渲染。这里只决定**什么时候问**（turn / step 的 query 归它管），并把整块原样放进同一条 `<user-reminder>`。要改记忆的排版或话术，去改 `dsh-openviking`。
 
 工具续跑时（`ovStepRecall: true`）：
 
