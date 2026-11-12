@@ -90,11 +90,21 @@
 
 ## 安装
 
-前提：这是一个**本地包**，需要让 profile 能解析到它。
+前提：这是一个外部包，需要让 profile 能解析到它。
 
-### 方式 A —— 作为 bundle 安装（推荐）
+### 方式 A —— 从 Git 仓库安装（推荐）
 
 在 profile 目录（`~/.dsh/profiles/<profile>`）里：
+
+```sh
+pnpm add "github:abc12524/dsh-inject-context"
+# 或
+pnpm add "git+https://github.com/abc12524/dsh-inject-context.git"
+```
+
+specifier **必须带协议**：`github:owner/repo` 或 `https://…/repo.git`。写成 `github.com:owner/repo` 时 pnpm 会把 `github.com` 当成协议，报 `ERR_PNPM_UNSUPPORTED_PROTOCOL`。
+
+### 方式 A2 —— 从本地目录安装
 
 ```sh
 pnpm add "file:C:/path/to/dsh-inject-context"
