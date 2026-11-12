@@ -1,6 +1,6 @@
 {
   "name": "dsh-inject-context",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "DeepSeek Harness context-injection plugin: inserts the skill list, recalled OpenViking memories (served by dsh-openviking), and user tips directly below the user's question at agent/pre-step, every block wrapped in <user-reminder>, with a settings card holding one switch per block.",
   "author": "abc12524",
   "repository": {

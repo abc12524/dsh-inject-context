@@ -71,6 +71,52 @@ const runtimeContext = (id, text) => ({
 })
 
 /**
+ * Mirror of the harness's `snapshotJsonValue()` gate, which runs on every
+ * `session.append()` before the event reaches the log: anything JSON cannot
+ * represent losslessly fails the whole append.
+ *
+ * `undefined` is the one that bites in practice. `createUserMessage()` snapshots
+ * with `structuredClone`, which keeps a key whose value is `undefined` rather
+ * than dropping it, so an optional source field left unset poisons the event and
+ * the runtime reports `session event "user/message" carries
+ * non-JSON-serializable data`.
+ *
+ * @param value - candidate event payload.
+ * @param subject - label used in the assertion messages.
+ * @param path - position inside the payload, for readable failures.
+ * @param seen - objects already visited, so a cycle is reported not walked.
+ */
+function assertLosslessJson(value, subject, path = '$', seen = new WeakSet()) {
+  if (value === null) return
+  const type = typeof value
+  if (type === 'boolean' || type === 'string') return
+  if (type === 'number') {
+    assert.ok(Number.isFinite(value), `${subject}: ${path} is not a finite number`)
+    assert.ok(!Object.is(value, -0), `${subject}: ${path} is -0, which JSON loses`)
+    return
+  }
+  assert.equal(type, 'object', `${subject}: ${path} is a ${type}, which JSON cannot carry`)
+  assert.ok(!seen.has(value), `${subject}: ${path} closes a cycle`)
+  seen.add(value)
+  if (Array.isArray(value)) {
+    assert.equal(Object.getPrototypeOf(value), Array.prototype, `${subject}: ${path} is an array subclass`)
+    for (let index = 0; index < value.length; index += 1) {
+      assertLosslessJson(value[index], subject, `${path}[${index}]`, seen)
+    }
+    return
+  }
+  const proto = Object.getPrototypeOf(value)
+  assert.ok(
+    proto === Object.prototype || proto === null,
+    `${subject}: ${path} is a class instance without toJSON()`,
+  )
+  for (const key of Reflect.ownKeys(value)) {
+    assert.equal(typeof key, 'string', `${subject}: ${path} has a symbol key`)
+    assertLosslessJson(value[key], subject, `${path}.${key}`, seen)
+  }
+}
+
+/**
  * Mirror of `assertMessageEventShape` from @deepseek-ai/dsh-session for a
  * `user/message` event. A message that fails this would throw at
  * `session.append('user/message', ...)` in a real run.
@@ -92,6 +138,9 @@ function assertPersistableUserMessage(message, subject) {
       `${subject}: tool-change blocks require developer role`,
     )
   }
+  // The event's data must be lossless JSON before the log will take it; an
+  // `undefined` anywhere in `source` is the usual culprit.
+  assertLosslessJson(message, subject)
 }
 
 /** Every inserted block must be fenced, body-only. */
