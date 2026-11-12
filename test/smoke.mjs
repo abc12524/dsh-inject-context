@@ -677,9 +677,20 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
   // tips text stays editable next to its switch.
   const labels = []
   const ids = []
+  const rows = []
   const walk = (node) => {
     if (!node || typeof node !== 'object') return
     if (node.type === 'Switch') labels.push(node.props.label)
+    if (node.props?.className === 'dsh-inject-context-switch') {
+      const [block, toggle] = node.props.children
+      const [name, hint] = block.props.children
+      rows.push({
+        name: name.props.children,
+        hint: hint.props.children,
+        aria: toggle.props.label,
+        checked: toggle.props.checked,
+      })
+    }
     if (node.props?.id) ids.push(node.props.id)
     for (const child of Array.isArray(node.props?.children) ? node.props.children : []) walk(child)
   }
@@ -706,7 +717,27 @@ console.log(`case 1  ok  Config: ${VOLATILE_FIELDS.length} volatile fields, no O
   assert.deepEqual(labels, ['enabled', 'ov', 'ovProfile', 'skills', 'tips'], 'one switch per injected block')
   assert.deepEqual(ids, ['inject-config-user-tips'], 'the tips text rides the same form')
 
-  console.log('case 12 ok  browser half registers four block switches plus the master switch')
+  // A bare switch reads as an anonymous toggle: the primitives' Switch exposes
+  // its name through aria-label only, so each control must sit in a row that
+  // prints the name (and its explanation) as text.
+  assert.equal(rows.length, 5, 'every switch is wrapped in a labelled row')
+  for (const row of rows) {
+    assert.ok(row.name && row.name.length > 0, `${row.aria}: the row prints a visible name`)
+    assert.equal(row.name, row.aria, `${row.aria}: the visible name matches the accessible one`)
+    assert.ok(row.hint && row.hint.length > 0, `${row.aria}: the row explains what the switch does`)
+  }
+  assert.deepEqual(
+    rows.map((row) => row.name),
+    ['enabled', 'ov', 'ovProfile', 'skills', 'tips'],
+    'the rows follow the registry order',
+  )
+  assert.deepEqual(
+    rows.map((row) => row.checked),
+    [true, true, false, true, true],
+    'each row reflects its own snapshot key',
+  )
+
+  console.log('case 12 ok  browser half registers four block switches plus the master switch, each with a visible name')
 }
 
 // ---------------------------------------------------------------------------
